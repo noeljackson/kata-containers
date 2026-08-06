@@ -192,6 +192,106 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn test_codewire_confidential_storage_policy_allowlist() {
+        let rules_path = path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rules.rego");
+        let mut rules = fs::read_to_string(rules_path).expect("rules.rego should open");
+        rules.push_str(
+            r#"
+policy_data := {}
+default CodewireStorageTest := false
+CodewireStorageTest := allow_storages([], [input], "", "")
+"#,
+        );
+
+        let key_id = "01981234-5678-7abc-8def-0123456789ab";
+        let valid = serde_json::json!({
+            "driver": "blk",
+            "driver_options": [
+                "io.codewire.storage.encryption=luks2",
+                "io.codewire.storage.source=auto",
+                format!("io.codewire.storage.key-uri=kbs:///default/codewire-workspace-luks/{key_id}"),
+                "io.codewire.storage.filesystem=ext4",
+                "io.codewire.storage.grow=true"
+            ],
+            "fs_group": null,
+            "fstype": "ext4",
+            "mount_point": "/run/kata-containers/sandbox/storage/MDAvMDA=",
+            "options": [],
+            "source": "00/00",
+            "shared": false
+        });
+
+        async fn allowed(rules: &str, storage: &serde_json::Value) -> bool {
+            let mut policy = AgentPolicy::new();
+            policy.set_policy(rules).await.unwrap();
+            policy
+                .allow_request("CodewireStorageTest", &storage.to_string())
+                .await
+                .unwrap()
+                .0
+        }
+
+        assert!(allowed(&rules, &valid).await);
+
+        let mut invalid_cases = Vec::new();
+
+        let mut unknown = valid.clone();
+        unknown["driver_options"]
+            .as_array_mut()
+            .unwrap()
+            .push(serde_json::json!("io.codewire.storage.unexpected=value"));
+        invalid_cases.push(unknown);
+
+        let mut wrong_order = valid.clone();
+        wrong_order["driver_options"]
+            .as_array_mut()
+            .unwrap()
+            .swap(0, 1);
+        invalid_cases.push(wrong_order);
+
+        let mut wrong_uri = valid.clone();
+        wrong_uri["driver_options"][2] = serde_json::json!(format!(
+            "io.codewire.storage.key-uri=kbs:///default/other/{key_id}"
+        ));
+        invalid_cases.push(wrong_uri);
+
+        let mut wrong_mount = valid.clone();
+        wrong_mount["mount_point"] = serde_json::json!("/workspace");
+        invalid_cases.push(wrong_mount);
+
+        let mut wrong_filesystem = valid.clone();
+        wrong_filesystem["fstype"] = serde_json::json!("xfs");
+        invalid_cases.push(wrong_filesystem);
+
+        let mut wrong_driver = valid.clone();
+        wrong_driver["driver"] = serde_json::json!("local");
+        invalid_cases.push(wrong_driver);
+
+        let mut wrong_source = valid.clone();
+        wrong_source["source"] = serde_json::json!("/dev/vda");
+        invalid_cases.push(wrong_source);
+
+        let mut extra_mount_option = valid.clone();
+        extra_mount_option["options"] = serde_json::json!(["discard"]);
+        invalid_cases.push(extra_mount_option);
+
+        let mut shared = valid.clone();
+        shared["shared"] = serde_json::json!(true);
+        invalid_cases.push(shared);
+
+        let mut zero_fs_group = valid.clone();
+        zero_fs_group["fs_group"] = serde_json::json!({
+            "group_id": 0,
+            "group_change_policy": 0
+        });
+        invalid_cases.push(zero_fs_group);
+
+        for invalid in invalid_cases {
+            assert!(!allowed(&rules, &invalid).await);
+        }
+    }
+
     fn decode_policy(initdata_anno: &str) -> String {
         let initdata = kata_types::initdata::decode_initdata(initdata_anno)
             .expect("should decode initdata anno");

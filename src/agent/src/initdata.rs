@@ -9,6 +9,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+use std::sync::OnceLock;
 #[cfg(feature = "init-data")]
 use std::{os::unix::fs::FileTypeExt, path::Path};
 
@@ -27,6 +28,38 @@ pub const INITDATA_PATH: &str = "/run/confidential-containers/initdata";
 const AA_CONFIG_KEY: &str = "aa.toml";
 const CDH_CONFIG_KEY: &str = "cdh.toml";
 const POLICY_KEY: &str = "policy.rego";
+pub(crate) const WORKSPACE_STORAGE_KEY_ID_CLAIM: &str = "codewire_workspace_storage_key_id";
+
+static WORKSPACE_STORAGE_KEY_ID: OnceLock<String> = OnceLock::new();
+
+pub(crate) fn workspace_storage_key_id() -> Option<&'static str> {
+    WORKSPACE_STORAGE_KEY_ID.get().map(String::as_str)
+}
+
+pub(crate) fn is_canonical_uuid(value: &str) -> bool {
+    const GROUP_LENGTHS: [usize; 5] = [8, 4, 4, 4, 12];
+    let groups = value.split('-').collect::<Vec<_>>();
+    groups.len() == GROUP_LENGTHS.len()
+        && groups
+            .iter()
+            .zip(GROUP_LENGTHS)
+            .all(|(group, expected_len)| {
+                group.len() == expected_len
+                    && group
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            })
+}
+
+fn workspace_storage_key_id_from_initdata(initdata: &InitData) -> Result<Option<String>> {
+    let Some(key_id) = initdata.get_coco_data(WORKSPACE_STORAGE_KEY_ID_CLAIM) else {
+        return Ok(None);
+    };
+    if !is_canonical_uuid(key_id) {
+        bail!("invalid confidential storage key ID claim");
+    }
+    Ok(Some(key_id.clone()))
+}
 
 /// The path of initdata toml
 pub const INITDATA_TOML_PATH: &str = concatcp!(INITDATA_PATH, "/initdata.toml");
@@ -148,6 +181,12 @@ pub async fn initialize_initdata(logger: &Logger) -> Result<Option<InitdataRetur
     info!(logger, "Initdata version: {}", initdata.version());
     initdata.validate()?;
 
+    if let Some(key_id) = workspace_storage_key_id_from_initdata(&initdata)? {
+        WORKSPACE_STORAGE_KEY_ID
+            .set(key_id)
+            .map_err(|_| anyhow::anyhow!("confidential storage key ID claim initialized twice"))?;
+    }
+
     tokio::fs::write(INITDATA_TOML_PATH, &initdata_content)
         .await
         .context("write initdata toml failed")?;
@@ -185,7 +224,7 @@ pub async fn initialize_initdata(logger: &Logger) -> Result<Option<InitdataRetur
 
 #[cfg(test)]
 mod tests {
-    use crate::initdata::read_initdata;
+    use super::*;
 
     const INITDATA_IMG_PATH: &str = "testdata/initdata.img";
     const INITDATA_PLAINTEXT: &[u8] = b"some content";
@@ -194,5 +233,33 @@ mod tests {
     async fn parse_initdata() {
         let initdata = read_initdata(INITDATA_IMG_PATH).await.unwrap();
         assert_eq!(initdata, INITDATA_PLAINTEXT);
+    }
+
+    #[test]
+    fn extracts_canonical_workspace_storage_key_id() {
+        let mut initdata = InitData::new("sha384", "0.1.0");
+        initdata.insert_data(
+            WORKSPACE_STORAGE_KEY_ID_CLAIM,
+            "01981234-5678-7abc-8def-0123456789ab",
+        );
+
+        assert_eq!(
+            workspace_storage_key_id_from_initdata(&initdata).unwrap(),
+            Some("01981234-5678-7abc-8def-0123456789ab".to_string())
+        );
+    }
+
+    #[test]
+    fn rejects_noncanonical_workspace_storage_key_id() {
+        for key_id in [
+            "01981234-5678-7ABC-8def-0123456789ab",
+            "not-a-uuid",
+            "0198123456787abc8def0123456789ab",
+        ] {
+            let mut initdata = InitData::new("sha384", "0.1.0");
+            initdata.insert_data(WORKSPACE_STORAGE_KEY_ID_CLAIM, key_id);
+
+            assert!(workspace_storage_key_id_from_initdata(&initdata).is_err());
+        }
     }
 }

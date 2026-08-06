@@ -282,6 +282,10 @@ type Mount struct {
 	// fresh block volume. The filesystem type comes from the Storage Fstype.
 	BlockDeviceCreateFs bool
 
+	// ConfidentialStorage contains validated, non-secret direct-volume
+	// metadata for a persistent volume that CDH opens inside the guest.
+	ConfidentialStorage *volume.ConfidentialStorageMetadata
+
 	// Shared indicates whether the mount is shared across containers.
 	Shared bool
 }

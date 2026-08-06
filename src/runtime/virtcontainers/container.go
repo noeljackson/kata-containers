@@ -645,14 +645,25 @@ func (c *Container) createBlockDevices(ctx context.Context) error {
 		// Handle directly assigned volume. Update the mount info based on the mount info json.
 		mntInfo, e := volume.VolumeMountInfo(c.mounts[i].Source)
 		if e != nil && !os.IsNotExist(e) {
+			if errors.Is(e, volume.ErrInvalidConfidentialStorageMetadata) {
+				return fmt.Errorf("failed to validate confidential storage metadata for %s: %w", c.mounts[i].Source, e)
+			}
 			c.Logger().WithError(e).WithField("mount-source", c.mounts[i].Source).
 				Error("failed to parse the mount info file for a direct assigned volume")
 			continue
 		}
 
 		if mntInfo != nil {
+			confidentialStorage, err := mntInfo.ConfidentialStorage()
+			if err != nil {
+				return fmt.Errorf("failed to validate confidential storage metadata for %s: %w", c.mounts[i].Source, err)
+			}
+
 			// Write out sandbox info file on the mount source to allow CSI to communicate with the runtime
 			if err := volume.RecordSandboxID(c.sandboxID, c.mounts[i].Source); err != nil {
+				if confidentialStorage != nil {
+					return fmt.Errorf("failed to record confidential direct-volume sandbox mapping: %w", err)
+				}
 				c.Logger().WithError(err).Error("error writing sandbox info")
 			}
 
@@ -674,6 +685,7 @@ func (c *Container) createBlockDevices(ctx context.Context) error {
 			c.mounts[i].Type = mntInfo.FsType
 			c.mounts[i].Options = mntInfo.Options
 			c.mounts[i].ReadOnly = readonly
+			c.mounts[i].ConfidentialStorage = confidentialStorage
 
 			for key, value := range mntInfo.Metadata {
 				switch key {
@@ -699,6 +711,13 @@ func (c *Container) createBlockDevices(ctx context.Context) error {
 						continue
 					}
 					c.mounts[i].FSGroupChangePolicy = volume.FSGroupChangePolicy(value)
+				case volume.ConfidentialStorageEncryptionMetadataKey,
+					volume.ConfidentialStorageSourceMetadataKey,
+					volume.ConfidentialStorageKeyURIMetadataKey,
+					volume.ConfidentialStorageFilesystemMetadataKey,
+					volume.ConfidentialStorageGrowMetadataKey:
+					// The complete contract was validated above. Only this fixed
+					// allowlist is forwarded through DriverOptions.
 				default:
 					c.Logger().Warnf("Ignoring unsupported direct-assignd volume metadata key: %s, value: %s", key, value)
 				}

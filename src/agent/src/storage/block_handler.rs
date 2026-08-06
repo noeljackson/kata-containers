@@ -5,6 +5,7 @@
 //
 
 use crate::linux_abi::pcipath_from_dev_tree_path;
+use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
@@ -38,6 +39,13 @@ use slog::Logger;
 use std::str::FromStr;
 
 const EPHEMERAL_ENCRYPTION_DRIVER_OPTION: &str = "encryption_key=ephemeral";
+const CONFIDENTIAL_STORAGE_DRIVER_OPTION_PREFIX: &str = "io.codewire.storage.";
+const CONFIDENTIAL_STORAGE_ENCRYPTION_KEY: &str = "io.codewire.storage.encryption";
+const CONFIDENTIAL_STORAGE_SOURCE_KEY: &str = "io.codewire.storage.source";
+const CONFIDENTIAL_STORAGE_KEY_URI_KEY: &str = "io.codewire.storage.key-uri";
+const CONFIDENTIAL_STORAGE_FILESYSTEM_KEY: &str = "io.codewire.storage.filesystem";
+const CONFIDENTIAL_STORAGE_GROW_KEY: &str = "io.codewire.storage.grow";
+const CONFIDENTIAL_STORAGE_KEY_URI_PREFIX: &str = "kbs:///default/codewire-workspace-luks/";
 const MKFS_EXT4: &str = "mkfs.ext4";
 const BLOCK_EMPTYDIR_EXT4_MKFS_OPTS: [&str; 8] =
     ["-O", "^has_journal", "-m", "0", "-i", "163840", "-I", "128"];
@@ -46,6 +54,12 @@ const BLOCK_EMPTYDIR_EXT4_MKFS_OPTS: [&str; 8] =
 struct BlockStorageDriverOptions {
     has_ephemeral_encryption: bool,
     should_create_filesystem: bool,
+    confidential_storage: Option<ConfidentialStorageDriverOptions>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct ConfidentialStorageDriverOptions {
+    key_uri: String,
 }
 
 fn get_device_number(dev_path: &str, metadata: Option<&fs::Metadata>) -> Result<String> {
@@ -67,7 +81,17 @@ async fn handle_block_storage(
 ) -> Result<Arc<dyn StorageDevice>> {
     let options = block_storage_driver_options(storage)?;
 
-    if options.has_ephemeral_encryption {
+    if let Some(confidential_storage) = options.confidential_storage {
+        crate::rpc::cdh_confidential_storage_mount(
+            "block-device",
+            dev_num,
+            &storage.mount_point,
+            &confidential_storage.key_uri,
+        )
+        .await?;
+        set_ownership(logger, storage)?;
+        new_device(storage.mount_point.clone())
+    } else if options.has_ephemeral_encryption {
         let mkfs_opts = BLOCK_EMPTYDIR_EXT4_MKFS_OPTS.join(" ");
         crate::rpc::cdh_secure_mount(
             "block-device",
@@ -89,11 +113,25 @@ async fn handle_block_storage(
 }
 
 fn block_storage_driver_options(storage: &Storage) -> Result<BlockStorageDriverOptions> {
+    block_storage_driver_options_with_claim(storage, crate::initdata::workspace_storage_key_id())
+}
+
+fn block_storage_driver_options_with_claim(
+    storage: &Storage,
+    initdata_key_id: Option<&str>,
+) -> Result<BlockStorageDriverOptions> {
     let has_ephemeral_encryption = storage
         .driver_options
         .iter()
         .any(|opt| opt == EPHEMERAL_ENCRYPTION_DRIVER_OPTION);
     let should_create_filesystem = should_create_block_filesystem(storage);
+    let confidential_storage = confidential_storage_driver_options(storage, initdata_key_id)?;
+
+    if confidential_storage.is_some() && (has_ephemeral_encryption || should_create_filesystem) {
+        return Err(anyhow!(
+            "confidential storage cannot be combined with ephemeral encryption or host-requested filesystem creation"
+        ));
+    }
 
     if has_ephemeral_encryption && !should_create_filesystem {
         return Err(anyhow!(
@@ -106,7 +144,72 @@ fn block_storage_driver_options(storage: &Storage) -> Result<BlockStorageDriverO
     Ok(BlockStorageDriverOptions {
         has_ephemeral_encryption,
         should_create_filesystem,
+        confidential_storage,
     })
+}
+
+fn confidential_storage_driver_options(
+    storage: &Storage,
+    initdata_key_id: Option<&str>,
+) -> Result<Option<ConfidentialStorageDriverOptions>> {
+    let mut metadata = HashMap::new();
+    for option in &storage.driver_options {
+        if !option.starts_with(CONFIDENTIAL_STORAGE_DRIVER_OPTION_PREFIX) {
+            continue;
+        }
+        let Some((key, value)) = option.split_once('=') else {
+            return Err(anyhow!("malformed confidential storage driver option"));
+        };
+        if !matches!(
+            key,
+            CONFIDENTIAL_STORAGE_ENCRYPTION_KEY
+                | CONFIDENTIAL_STORAGE_SOURCE_KEY
+                | CONFIDENTIAL_STORAGE_KEY_URI_KEY
+                | CONFIDENTIAL_STORAGE_FILESYSTEM_KEY
+                | CONFIDENTIAL_STORAGE_GROW_KEY
+        ) {
+            return Err(anyhow!("unsupported confidential storage driver option"));
+        }
+        if metadata.insert(key, value).is_some() {
+            return Err(anyhow!("duplicate confidential storage driver option"));
+        }
+    }
+
+    if metadata.is_empty() {
+        return Ok(None);
+    }
+    if metadata.len() != 5 {
+        return Err(anyhow!("incomplete confidential storage driver options"));
+    }
+    if storage.fstype != "ext4"
+        || metadata.get(CONFIDENTIAL_STORAGE_ENCRYPTION_KEY) != Some(&"luks2")
+        || metadata.get(CONFIDENTIAL_STORAGE_SOURCE_KEY) != Some(&"auto")
+        || metadata.get(CONFIDENTIAL_STORAGE_FILESYSTEM_KEY) != Some(&"ext4")
+        || metadata.get(CONFIDENTIAL_STORAGE_GROW_KEY) != Some(&"true")
+    {
+        return Err(anyhow!("invalid confidential storage driver option value"));
+    }
+
+    let key_uri = metadata
+        .get(CONFIDENTIAL_STORAGE_KEY_URI_KEY)
+        .ok_or_else(|| anyhow!("missing confidential storage key URI"))?;
+    let key_id = key_uri
+        .strip_prefix(CONFIDENTIAL_STORAGE_KEY_URI_PREFIX)
+        .ok_or_else(|| anyhow!("invalid confidential storage key URI"))?;
+    if !crate::initdata::is_canonical_uuid(key_id) {
+        return Err(anyhow!("invalid confidential storage key URI UUID"));
+    }
+    let measured_key_id = initdata_key_id
+        .ok_or_else(|| anyhow!("missing measured confidential storage key ID claim"))?;
+    if key_id != measured_key_id {
+        return Err(anyhow!(
+            "confidential storage key URI does not match measured init-data claim"
+        ));
+    }
+
+    Ok(Some(ConfidentialStorageDriverOptions {
+        key_uri: (*key_uri).to_string(),
+    }))
 }
 
 fn should_create_block_filesystem(storage: &Storage) -> bool {
@@ -184,6 +287,7 @@ mod tests {
             BlockStorageDriverOptions {
                 has_ephemeral_encryption: false,
                 should_create_filesystem: false,
+                confidential_storage: None,
             }
         );
     }
@@ -199,6 +303,7 @@ mod tests {
             BlockStorageDriverOptions {
                 has_ephemeral_encryption: false,
                 should_create_filesystem: true,
+                confidential_storage: None,
             }
         );
     }
@@ -217,6 +322,7 @@ mod tests {
             BlockStorageDriverOptions {
                 has_ephemeral_encryption: true,
                 should_create_filesystem: true,
+                confidential_storage: None,
             }
         );
     }
@@ -228,6 +334,98 @@ mod tests {
         let err = block_storage_driver_options(&storage).unwrap_err();
 
         assert!(err.to_string().contains(KATA_BLOCK_VOLUME_CREATE_FS));
+    }
+
+    const TEST_KEY_ID: &str = "01981234-5678-7abc-8def-0123456789ab";
+
+    fn confidential_storage() -> Storage {
+        Storage {
+            fstype: "ext4".to_string(),
+            driver_options: vec![
+                format!("{CONFIDENTIAL_STORAGE_ENCRYPTION_KEY}=luks2"),
+                format!("{CONFIDENTIAL_STORAGE_SOURCE_KEY}=auto"),
+                format!(
+                    "{CONFIDENTIAL_STORAGE_KEY_URI_KEY}={CONFIDENTIAL_STORAGE_KEY_URI_PREFIX}{TEST_KEY_ID}"
+                ),
+                format!("{CONFIDENTIAL_STORAGE_FILESYSTEM_KEY}=ext4"),
+                format!("{CONFIDENTIAL_STORAGE_GROW_KEY}=true"),
+            ],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn block_storage_options_allow_confidential_storage_bound_to_initdata() {
+        let storage = confidential_storage();
+
+        let options = block_storage_driver_options_with_claim(&storage, Some(TEST_KEY_ID)).unwrap();
+
+        assert_eq!(
+            options,
+            BlockStorageDriverOptions {
+                has_ephemeral_encryption: false,
+                should_create_filesystem: false,
+                confidential_storage: Some(ConfidentialStorageDriverOptions {
+                    key_uri: format!("{CONFIDENTIAL_STORAGE_KEY_URI_PREFIX}{TEST_KEY_ID}"),
+                }),
+            }
+        );
+    }
+
+    #[test]
+    fn block_storage_options_reject_confidential_storage_without_matching_initdata() {
+        let storage = confidential_storage();
+
+        assert!(block_storage_driver_options_with_claim(&storage, None).is_err());
+        assert!(block_storage_driver_options_with_claim(
+            &storage,
+            Some("01989999-9999-7999-8999-999999999999")
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn block_storage_options_reject_invalid_confidential_contracts() {
+        let mut cases = Vec::new();
+
+        let mut missing = confidential_storage();
+        missing.driver_options.pop();
+        cases.push(missing);
+
+        let mut unknown = confidential_storage();
+        unknown
+            .driver_options
+            .push("io.codewire.storage.unexpected=value".to_string());
+        cases.push(unknown);
+
+        let mut duplicate = confidential_storage();
+        duplicate
+            .driver_options
+            .push(format!("{CONFIDENTIAL_STORAGE_GROW_KEY}=true"));
+        cases.push(duplicate);
+
+        let mut wrong_value = confidential_storage();
+        wrong_value.driver_options[1] = format!("{CONFIDENTIAL_STORAGE_SOURCE_KEY}=empty");
+        cases.push(wrong_value);
+
+        let mut wrong_filesystem = confidential_storage();
+        wrong_filesystem.fstype = "xfs".to_string();
+        cases.push(wrong_filesystem);
+
+        let mut malformed_uri = confidential_storage();
+        malformed_uri.driver_options[2] =
+            format!("{CONFIDENTIAL_STORAGE_KEY_URI_KEY}=kbs:///default/other/{TEST_KEY_ID}");
+        cases.push(malformed_uri);
+
+        let mut mixed_ephemeral = confidential_storage();
+        mixed_ephemeral
+            .driver_options
+            .push(EPHEMERAL_ENCRYPTION_DRIVER_OPTION.to_string());
+        cases.push(mixed_ephemeral);
+
+        for storage in cases {
+            assert!(block_storage_driver_options_with_claim(&storage, Some(TEST_KEY_ID)).is_err());
+        }
     }
 }
 

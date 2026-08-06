@@ -36,7 +36,10 @@ import (
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/types"
 )
 
-const sysHugepagesDir = "/sys/kernel/mm/hugepages"
+const (
+	sysHugepagesDir              = "/sys/kernel/mm/hugepages"
+	testConfidentialStorageKeyID = "01981234-5678-7abc-8def-0123456789ab"
+)
 
 var (
 	testBlkDriveFormat     = "testBlkDriveFormat"
@@ -375,6 +378,34 @@ func TestHandleDeviceBlockVolume(t *testing.T) {
 				DriverOptions: []string{
 					encryptionKeyDriverOption + "=ephemeral",
 					volume.BlockVolumeCreateFsDriverKey,
+				},
+			},
+		},
+		{
+			BlockDeviceDriver: config.VirtioBlock,
+			inputMount: Mount{
+				Type: "ext4",
+				ConfidentialStorage: &volume.ConfidentialStorageMetadata{
+					KeyID:  testConfidentialStorageKeyID,
+					KeyURI: volume.ConfidentialStorageKeyURIPrefix + testConfidentialStorageKeyID,
+				},
+			},
+			inputDev: &drivers.BlockDevice{
+				BlockDrive: &config.BlockDrive{
+					PCIPath:  testPCIPath,
+					VirtPath: testVirtPath,
+				},
+			},
+			resultVol: &pb.Storage{
+				Driver: kataBlkDevType,
+				Source: testPCIPath.String(),
+				Fstype: "ext4",
+				DriverOptions: []string{
+					volume.ConfidentialStorageEncryptionMetadataKey + "=" + volume.ConfidentialStorageEncryptionValue,
+					volume.ConfidentialStorageSourceMetadataKey + "=" + volume.ConfidentialStorageSourceValue,
+					volume.ConfidentialStorageKeyURIMetadataKey + "=" + volume.ConfidentialStorageKeyURIPrefix + testConfidentialStorageKeyID,
+					volume.ConfidentialStorageFilesystemMetadataKey + "=" + volume.ConfidentialStorageFilesystemValue,
+					volume.ConfidentialStorageGrowMetadataKey + "=" + volume.ConfidentialStorageGrowValue,
 				},
 			},
 		},

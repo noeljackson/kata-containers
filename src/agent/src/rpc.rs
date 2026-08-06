@@ -2628,6 +2628,52 @@ pub(crate) async fn cdh_secure_mount(
         ("dataIntegrity".to_string(), integrity),
     ]);
 
+    perform_cdh_secure_mount(device_type, &options, mount_point).await
+}
+
+fn confidential_storage_cdh_options(
+    device_id: &str,
+    key_uri: &str,
+) -> std::collections::HashMap<String, String> {
+    std::collections::HashMap::from([
+        ("deviceId".to_string(), device_id.to_string()),
+        ("sourceType".to_string(), "auto".to_string()),
+        ("targetType".to_string(), "fileSystem".to_string()),
+        ("filesystemType".to_string(), "ext4".to_string()),
+        ("encryptionType".to_string(), "luks2".to_string()),
+        ("key".to_string(), key_uri.to_string()),
+        ("grow".to_string(), "true".to_string()),
+    ])
+}
+
+pub(crate) async fn cdh_confidential_storage_mount(
+    device_type: &str,
+    device_id: &str,
+    mount_point: &str,
+    key_uri: &str,
+) -> Result<()> {
+    if !confidential_data_hub::is_cdh_client_initialized() {
+        return Err(anyhow!(
+            "Confidential Data Hub is required for confidential persistent storage"
+        ));
+    }
+
+    info!(
+        sl(),
+        "opening attested confidential persistent storage: device_type {}, device_id {}",
+        device_type,
+        device_id
+    );
+
+    let options = confidential_storage_cdh_options(device_id, key_uri);
+    perform_cdh_secure_mount(device_type, &options, mount_point).await
+}
+
+async fn perform_cdh_secure_mount(
+    device_type: &str,
+    options: &std::collections::HashMap<String, String>,
+    mount_point: &str,
+) -> Result<()> {
     std::fs::create_dir_all(mount_point).inspect_err(|e| {
         error!(
             sl(),
@@ -2635,7 +2681,7 @@ pub(crate) async fn cdh_secure_mount(
         );
     })?;
 
-    confidential_data_hub::secure_mount(device_type, &options, vec![], mount_point).await?;
+    confidential_data_hub::secure_mount(device_type, options, vec![], mount_point).await?;
 
     Ok(())
 }
@@ -2721,6 +2767,33 @@ mod tests {
     use which::which;
 
     const CGROUP_PARENT: &str = "kata.agent.test.k8s.io";
+
+    #[test]
+    fn confidential_storage_cdh_request_is_exact_and_persistent() {
+        let key_uri = "kbs:///default/codewire-workspace-luks/01981234-5678-7abc-8def-0123456789ab";
+
+        let options = confidential_storage_cdh_options("8:16", key_uri);
+
+        assert_eq!(options.len(), 7);
+        assert_eq!(options.get("deviceId").map(String::as_str), Some("8:16"));
+        assert_eq!(options.get("sourceType").map(String::as_str), Some("auto"));
+        assert_eq!(
+            options.get("targetType").map(String::as_str),
+            Some("fileSystem")
+        );
+        assert_eq!(
+            options.get("filesystemType").map(String::as_str),
+            Some("ext4")
+        );
+        assert_eq!(
+            options.get("encryptionType").map(String::as_str),
+            Some("luks2")
+        );
+        assert_eq!(options.get("key").map(String::as_str), Some(key_uri));
+        assert_eq!(options.get("grow").map(String::as_str), Some("true"));
+        assert!(!options.contains_key("dataIntegrity"));
+        assert!(!options.contains_key("mkfsOpts"));
+    }
 
     fn check_command(cmd: &str) -> bool {
         which(cmd).is_ok()

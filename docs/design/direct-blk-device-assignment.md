@@ -75,6 +75,28 @@ type MountInfo struct {
 ```
 Notes: given that the `mountInfo` is persisted to the disk by the Kata runtime, it shouldn't container any secrets (such as SMB mount password).
 
+For confidential persistent storage, the metadata map contains exactly the
+following namespaced keys (ordinary direct-volume metadata such as `fsGroup` is
+handled separately and is not forwarded to CDH):
+
+```text
+io.codewire.storage.encryption=luks2
+io.codewire.storage.source=auto
+io.codewire.storage.key-uri=kbs:///default/codewire-workspace-luks/<environment-uuid>
+io.codewire.storage.filesystem=ext4
+io.codewire.storage.grow=true
+```
+
+The runtime validates this complete allowlist before persisting it and sends the
+same fields to the guest in a stable order. The Agent rejects missing, duplicate,
+unknown, or conflicting confidential-storage fields and requires the URI UUID to
+equal the measured init-data claim `codewire_workspace_storage_key_id`. Only
+then does it ask CDH to open or initialize the LUKS2/ext4 device with
+`sourceType=auto` and online ext4 growth enabled. The KBS URI is non-secret
+metadata; plaintext key material is released to CDH inside the attested guest
+and is never included in
+`mountInfo` or Agent driver options.
+
 ## Implementation Details
 
 ### Kata runtime

@@ -12,6 +12,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
+
+	"github.com/kata-containers/kata-containers/src/runtime/pkg/uuid"
 )
 
 const (
@@ -22,7 +25,22 @@ const (
 	FSGroupMetadataKey             = "fsGroup"
 	FSGroupChangePolicyMetadataKey = "fsGroupChangePolicy"
 	BlockVolumeCreateFsDriverKey   = "create_filesystem"
+
+	ConfidentialStorageMetadataPrefix        = "io.codewire.storage."
+	ConfidentialStorageEncryptionMetadataKey = ConfidentialStorageMetadataPrefix + "encryption"
+	ConfidentialStorageSourceMetadataKey     = ConfidentialStorageMetadataPrefix + "source"
+	ConfidentialStorageKeyURIMetadataKey     = ConfidentialStorageMetadataPrefix + "key-uri"
+	ConfidentialStorageFilesystemMetadataKey = ConfidentialStorageMetadataPrefix + "filesystem"
+	ConfidentialStorageGrowMetadataKey       = ConfidentialStorageMetadataPrefix + "grow"
+
+	ConfidentialStorageEncryptionValue = "luks2"
+	ConfidentialStorageSourceValue     = "auto"
+	ConfidentialStorageFilesystemValue = "ext4"
+	ConfidentialStorageGrowValue       = "true"
+	ConfidentialStorageKeyURIPrefix    = "kbs:///default/codewire-workspace-luks/"
 )
+
+var ErrInvalidConfidentialStorageMetadata = errors.New("invalid confidential storage metadata")
 
 // FSGroupChangePolicy holds policies that will be used for applying fsGroup to a volume.
 // This type and the allowed values are tracking the PodFSGroupChangePolicy defined in
@@ -56,8 +74,91 @@ type MountInfo struct {
 	Options []string `json:"options,omitempty"`
 }
 
+// ConfidentialStorageMetadata is the validated, non-secret metadata needed to
+// open a Codewire persistent volume inside a confidential guest.
+type ConfidentialStorageMetadata struct {
+	KeyID  string
+	KeyURI string
+}
+
+// DriverOptions returns the fixed allowlist sent to the Kata Agent. Keep the
+// order stable because the Agent policy compares driver options as an array.
+func (m *ConfidentialStorageMetadata) DriverOptions() []string {
+	return []string{
+		ConfidentialStorageEncryptionMetadataKey + "=" + ConfidentialStorageEncryptionValue,
+		ConfidentialStorageSourceMetadataKey + "=" + ConfidentialStorageSourceValue,
+		ConfidentialStorageKeyURIMetadataKey + "=" + m.KeyURI,
+		ConfidentialStorageFilesystemMetadataKey + "=" + ConfidentialStorageFilesystemValue,
+		ConfidentialStorageGrowMetadataKey + "=" + ConfidentialStorageGrowValue,
+	}
+}
+
+// ConfidentialStorage validates Codewire metadata when any Codewire key is
+// present. Existing direct-volume metadata remains unaffected and is never
+// copied into the confidential-storage driver-option allowlist.
+func (m *MountInfo) ConfidentialStorage() (*ConfidentialStorageMetadata, error) {
+	detected := false
+	allowed := map[string]string{
+		ConfidentialStorageEncryptionMetadataKey: ConfidentialStorageEncryptionValue,
+		ConfidentialStorageSourceMetadataKey:     ConfidentialStorageSourceValue,
+		ConfidentialStorageKeyURIMetadataKey:     "",
+		ConfidentialStorageFilesystemMetadataKey: ConfidentialStorageFilesystemValue,
+		ConfidentialStorageGrowMetadataKey:       ConfidentialStorageGrowValue,
+	}
+
+	for key := range m.Metadata {
+		if !strings.HasPrefix(key, ConfidentialStorageMetadataPrefix) {
+			continue
+		}
+		detected = true
+		if _, ok := allowed[key]; !ok {
+			return nil, fmt.Errorf("%w: unsupported key %q", ErrInvalidConfidentialStorageMetadata, key)
+		}
+	}
+
+	if !detected {
+		return nil, nil
+	}
+	if m.VolumeType != "block" {
+		return nil, fmt.Errorf("%w: volume type must be block", ErrInvalidConfidentialStorageMetadata)
+	}
+	if m.FsType != ConfidentialStorageFilesystemValue {
+		return nil, fmt.Errorf("%w: filesystem must be ext4", ErrInvalidConfidentialStorageMetadata)
+	}
+
+	for key, expected := range allowed {
+		value, ok := m.Metadata[key]
+		if !ok {
+			return nil, fmt.Errorf("%w: missing key %q", ErrInvalidConfidentialStorageMetadata, key)
+		}
+		if expected != "" && value != expected {
+			return nil, fmt.Errorf("%w: invalid value for key %q", ErrInvalidConfidentialStorageMetadata, key)
+		}
+	}
+
+	keyURI := m.Metadata[ConfidentialStorageKeyURIMetadataKey]
+	keyID := strings.TrimPrefix(keyURI, ConfidentialStorageKeyURIPrefix)
+	if keyID == keyURI || keyID == "" {
+		return nil, fmt.Errorf("%w: invalid key URI", ErrInvalidConfidentialStorageMetadata)
+	}
+	parsed, err := uuid.Parse(keyID)
+	if err != nil || parsed.String() != keyID {
+		return nil, fmt.Errorf("%w: key URI must end in a canonical UUID", ErrInvalidConfidentialStorageMetadata)
+	}
+
+	return &ConfidentialStorageMetadata{KeyID: keyID, KeyURI: keyURI}, nil
+}
+
 // Add writes the mount info of a direct volume into a filesystem path known to Kata Container.
 func Add(volumePath string, mountInfo string) error {
+	var deserialized MountInfo
+	if err := json.Unmarshal([]byte(mountInfo), &deserialized); err != nil {
+		return err
+	}
+	if _, err := deserialized.ConfidentialStorage(); err != nil {
+		return err
+	}
+
 	volumeDir := filepath.Join(kataDirectVolumeRootPath, b64.URLEncoding.EncodeToString([]byte(volumePath)))
 	stat, err := os.Stat(volumeDir)
 	if err != nil {
@@ -70,11 +171,6 @@ func Add(volumePath string, mountInfo string) error {
 	}
 	if stat != nil && !stat.IsDir() {
 		return fmt.Errorf("%s should be a directory", volumeDir)
-	}
-
-	var deserialized MountInfo
-	if err := json.Unmarshal([]byte(mountInfo), &deserialized); err != nil {
-		return err
 	}
 
 	return os.WriteFile(filepath.Join(volumeDir, mountInfoFileName), []byte(mountInfo), 0600)
@@ -105,6 +201,9 @@ func VolumeMountInfo(volumePath string) (*MountInfo, error) {
 	}
 	var mountInfo MountInfo
 	if err := json.Unmarshal(buf, &mountInfo); err != nil {
+		return nil, err
+	}
+	if _, err := mountInfo.ConfidentialStorage(); err != nil {
 		return nil, err
 	}
 	return &mountInfo, nil
