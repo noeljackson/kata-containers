@@ -4,7 +4,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use std::{collections::HashMap, path::Path, process::Stdio, sync::Arc};
+use std::{collections::HashMap, io, path::Path, process::Stdio, sync::Arc};
 
 use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
@@ -19,7 +19,10 @@ use tokio::{
 
 use agent::Storage;
 use hypervisor::{device::device_manager::DeviceManager, utils::chown_to_parent, Hypervisor};
-use kata_types::{config::hypervisor::SharedFsInfo, rootless::is_rootless};
+use kata_types::{
+    config::hypervisor::{Hypervisor as HypervisorConfig, SharedFsInfo},
+    rootless::is_rootless,
+};
 
 use super::{
     share_virtio_fs::generate_sock_path, utils::ensure_dir_exist, utils::get_host_ro_shared_path,
@@ -100,9 +103,19 @@ impl ShareVirtioFsStandalone {
         Ok(args)
     }
 
+    fn virtiofsd_selinux_label(config: &HypervisorConfig) -> Option<String> {
+        if config.disable_selinux {
+            None
+        } else {
+            config.security_info.selinux_label.clone()
+        }
+    }
+
     async fn setup_virtiofsd(&self, h: &dyn Hypervisor) -> Result<()> {
         let sock_path = generate_sock_path(&h.get_jailer_root().await?);
-        let disable_guest_selinux = h.hypervisor_config().await.disable_guest_selinux;
+        let hypervisor_config = h.hypervisor_config().await;
+        let disable_guest_selinux = hypervisor_config.disable_guest_selinux;
+        let selinux_label = Self::virtiofsd_selinux_label(&hypervisor_config);
 
         let socket_path = if is_rootless() {
             // In rootless mode, we use relative socket paths instead of absolute paths
@@ -122,6 +135,22 @@ impl ShareVirtioFsStandalone {
 
         let mut cmd = Command::new(&self.config.virtio_fs_daemon);
         let child_cmd = cmd.args(&args).stderr(Stdio::piped());
+
+        if let Some(label) = selinux_label {
+            // The helper serves the same sandbox as the VMM and must carry the
+            // sandbox's MCS-scoped process label. Apply it in the child between
+            // fork and exec so an async executor thread cannot leak or lose the
+            // label while the command is being prepared.
+            unsafe {
+                child_cmd.pre_exec(move || {
+                    hypervisor::selinux::set_exec_label(&label).map_err(|err| {
+                        io::Error::other(format!(
+                            "failed to set virtiofsd SELinux process label: {err}"
+                        ))
+                    })
+                });
+            }
+        }
 
         if is_rootless() {
             // Change working directory to socket's parent directory
@@ -262,5 +291,35 @@ impl ShareFs for ShareVirtioFsStandalone {
         self.shutdown_virtiofsd()
             .await
             .context("failed to stop virtiofsd daemon")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ShareVirtioFsStandalone;
+    use kata_types::config::hypervisor::Hypervisor as HypervisorConfig;
+
+    const TEST_LABEL: &str = "system_u:system_r:container_t:s0:c1,c2";
+
+    #[test]
+    fn test_virtiofsd_selinux_label() {
+        let mut config = HypervisorConfig::default();
+
+        assert_eq!(
+            ShareVirtioFsStandalone::virtiofsd_selinux_label(&config),
+            None
+        );
+
+        config.security_info.selinux_label = Some(TEST_LABEL.to_string());
+        assert_eq!(
+            ShareVirtioFsStandalone::virtiofsd_selinux_label(&config).as_deref(),
+            Some(TEST_LABEL)
+        );
+
+        config.disable_selinux = true;
+        assert_eq!(
+            ShareVirtioFsStandalone::virtiofsd_selinux_label(&config),
+            None
+        );
     }
 }
