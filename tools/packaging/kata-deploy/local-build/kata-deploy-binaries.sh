@@ -376,8 +376,8 @@ get_coco_guest_components_container_image_ref() {
 	echo "${image}:${version}"
 }
 
-# The extension disk image is published as a multi-arch OCI index tagged with the
-# guest-components commit; the per-arch selection happens at pull time.
+# The extension disk is an OCI artifact. Upstream publishes a multi-arch index;
+# downstream builds may bind an architecture-specific immutable tag.
 get_coco_extension_disk_image_ref() {
 	local version image
 	version="$(get_from_kata_deps ".externals.coco-guest-components.version")"
@@ -399,6 +399,49 @@ get_coco_extension_provenance_repo() {
 
 get_latest_coco_extension_artefact_version() {
 	echo "$(get_from_kata_deps ".externals.coco-guest-components.version")-$(get_coco_extension_oci_arch)"
+}
+
+# Resolve exactly one platform manifest from either a multi-arch OCI index or an
+# architecture-specific OCI artifact. ORAS 1.2 cannot use `resolve --platform`
+# when the selected manifest has the standard empty artifact config, so inspect
+# the descriptor explicitly instead of asking ORAS to infer an image platform.
+resolve_oci_artifact_manifest() {
+	local image_ref="$1"
+	local go_arch="$2"
+	local descriptor media_type manifest digest tag
+
+	descriptor="$(oras manifest fetch --descriptor "${image_ref}")" \
+		|| die "Failed to fetch the OCI descriptor for ${image_ref}"
+	media_type="$(jq -er '.mediaType' <<<"${descriptor}")" \
+		|| die "OCI descriptor for ${image_ref} has no media type"
+
+	case "${media_type}" in
+		application/vnd.oci.image.index.v1+json | application/vnd.docker.distribution.manifest.list.v2+json)
+			manifest="$(oras manifest fetch "${image_ref}")" \
+				|| die "Failed to fetch the OCI index for ${image_ref}"
+			digest="$(jq -er --arg arch "${go_arch}" '
+				[.manifests[]? |
+				 select(.platform.os == "linux" and .platform.architecture == $arch) |
+				 .digest] |
+				 if length == 1 then .[0] else error("expected exactly one platform manifest") end
+			' <<<"${manifest}")" \
+				|| die "OCI index ${image_ref} does not contain exactly one linux/${go_arch} manifest"
+			;;
+		application/vnd.oci.image.manifest.v1+json | application/vnd.docker.distribution.manifest.v2+json)
+			tag="${image_ref##*:}"
+			[[ "${tag}" == *-"${go_arch}" ]] \
+				|| die "single-manifest OCI artifact tag ${image_ref} is not bound to ${go_arch}"
+			digest="$(jq -er '.digest' <<<"${descriptor}")" \
+				|| die "OCI descriptor for ${image_ref} has no digest"
+			;;
+		*)
+			die "Unsupported OCI descriptor media type for ${image_ref}: ${media_type}"
+			;;
+	esac
+
+	[[ "${digest}" =~ ^sha256:[0-9a-f]{64}$ ]] \
+		|| die "OCI descriptor for ${image_ref} has an invalid digest"
+	echo "${digest}"
 }
 
 ensure_oras_installed() {
@@ -784,8 +827,8 @@ install_image_confidential() {
 #Install CoCo extension image (erofs+verity, contains CoCo guest components + pause)
 #
 # The disk image is built and published by guest-components
-# (ghcr.io/confidential-containers/guest-components/coco-extension-disk) as a
-# multi-arch OCI index. Kata resolves the per-arch manifest digest, verifies its
+# (ghcr.io/confidential-containers/guest-components/coco-extension-disk) as an
+# OCI artifact. Kata selects exactly one platform manifest, verifies its
 # provenance attestation, and pulls exactly that digest into kata-static.
 install_image_coco_extension() {
 	local component="rootfs-image-coco-extension"
@@ -808,12 +851,11 @@ install_image_coco_extension() {
 	image="${disk_image_ref%%:*}"
 	go_arch="$(get_coco_extension_oci_arch)"
 
-	# Resolve the per-arch manifest digest out of the multi-arch index. This is the
-	# subject guest-components' provenance attestation is bound to, so we verify it
-	# and then pull that exact digest (avoiding a resolve/pull TOCTOU window).
+	# Resolve an exact per-architecture manifest. The digest is the provenance
+	# subject and avoids a resolve/pull TOCTOU window.
 	local digest
-	digest="$(oras resolve --platform "linux/${go_arch}" "${disk_image_ref}")" \
-		|| die "Failed to resolve ${disk_image_ref} for linux/${go_arch}; bump .externals.coco-guest-components.version in versions.yaml once guest-components has published the image"
+	digest="$(resolve_oci_artifact_manifest "${disk_image_ref}" "${go_arch}")" \
+		|| die "Failed to resolve ${disk_image_ref}; bump .externals.coco-guest-components.version in versions.yaml once guest-components has published the image"
 
 	verify_guest_components_oci_provenance "${image}" "${digest}"
 
