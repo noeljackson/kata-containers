@@ -85,9 +85,8 @@ impl Hypervisor for Qemu {
         waiter.0.recv().await;
 
         let inner = self.inner.read().await;
-        if let Ok(exit_code) = inner.wait_vm().await {
-            waiter.1 = exit_code;
-        }
+        let exit_code = inner.wait_vm().await?;
+        waiter.1 = exit_code;
 
         Ok(waiter.1)
     }
