@@ -27,6 +27,24 @@ use containerd_shim_protos::{api, sandbox_api};
 
 pub const SANDBOX_API_V1: &str = "runtime.v1.PodSandboxConfig";
 
+fn format_dns_config(servers: &[String], searches: &[String], options: &[String]) -> Vec<String> {
+    let mut dns = servers
+        .iter()
+        .filter(|server| !server.is_empty())
+        .map(|server| format!("nameserver {server}"))
+        .collect::<Vec<_>>();
+
+    if !searches.is_empty() {
+        dns.push(format!("search {}", searches.join(" ")));
+    }
+
+    if !options.is_empty() {
+        dns.push(format!("options {}", options.join(" ")));
+    }
+
+    dns
+}
+
 fn trans_from_shim_mount(from: &api::Mount) -> Mount {
     let options = from.options.to_vec();
     let mut read_only = false;
@@ -49,21 +67,11 @@ fn trans_from_shim_mount(from: &api::Mount) -> Mount {
 }
 
 fn dns_config_to_resolv_conf(dns_config: cri_api_v1::DNSConfig) -> Vec<String> {
-    let mut dns = dns_config
-        .servers
-        .into_iter()
-        .map(|server| format!("nameserver {server}"))
-        .collect::<Vec<_>>();
-
-    if !dns_config.searches.is_empty() {
-        dns.push(format!("search {}", dns_config.searches.join(" ")));
-    }
-
-    if !dns_config.options.is_empty() {
-        dns.push(format!("options {}", dns_config.options.join(" ")));
-    }
-
-    dns
+    format_dns_config(
+        &dns_config.servers,
+        &dns_config.searches,
+        &dns_config.options,
+    )
 }
 
 // There're a lot of information to create a sandbox from CreateSandboxRequest and the internal PodSandboxConfig.
@@ -354,6 +362,10 @@ mod tests {
         config.dns
     }
 
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
     #[test]
     fn create_sandbox_formats_dns_config_as_resolv_conf() {
         let mut dns_config = cri_api_v1::DNSConfig::new();
@@ -375,5 +387,35 @@ mod tests {
     #[test]
     fn create_sandbox_without_dns_config_has_empty_dns() {
         assert!(convert_create_sandbox_dns(None).is_empty());
+    }
+
+    #[test]
+    fn format_complete_dns_config() {
+        assert_eq!(
+            format_dns_config(
+                &strings(&["10.96.0.10", "2001:db8::53"]),
+                &strings(&["example.svc.cluster.local", "svc.cluster.local"]),
+                &strings(&["ndots:5", "single-request-reopen"]),
+            ),
+            strings(&[
+                "nameserver 10.96.0.10",
+                "nameserver 2001:db8::53",
+                "search example.svc.cluster.local svc.cluster.local",
+                "options ndots:5 single-request-reopen",
+            ])
+        );
+    }
+
+    #[test]
+    fn format_empty_dns_config() {
+        assert!(format_dns_config(&[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn format_dns_config_omits_empty_servers_without_duplicates() {
+        assert_eq!(
+            format_dns_config(&strings(&["", "10.96.0.10"]), &[], &[]),
+            strings(&["nameserver 10.96.0.10"])
+        );
     }
 }
