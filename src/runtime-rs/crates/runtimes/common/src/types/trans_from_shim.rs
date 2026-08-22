@@ -27,6 +27,24 @@ use containerd_shim_protos::{api, sandbox_api};
 
 pub const SANDBOX_API_V1: &str = "runtime.v1.PodSandboxConfig";
 
+fn format_dns_config(servers: &[String], searches: &[String], options: &[String]) -> Vec<String> {
+    let mut dns = servers
+        .iter()
+        .filter(|server| !server.is_empty())
+        .map(|server| format!("nameserver {server}"))
+        .collect::<Vec<_>>();
+
+    if !searches.is_empty() {
+        dns.push(format!("search {}", searches.join(" ")));
+    }
+
+    if !options.is_empty() {
+        dns.push(format!("options {}", options.join(" ")));
+    }
+
+    dns
+}
+
 fn trans_from_shim_mount(from: &api::Mount) -> Mount {
     let options = from.options.to_vec();
     let mut read_only = false;
@@ -60,12 +78,16 @@ impl TryFrom<sandbox_api::CreateSandboxRequest> for SandboxRequest {
 
         let config = cri_api_v1::PodSandboxConfig::parse_from_bytes(&from.options.value)?;
 
-        let mut dns: Vec<String> = vec![];
-        config.dns_config.map(|mut dns_config| {
-            dns.append(&mut dns_config.servers);
-            dns.append(&mut dns_config.servers);
-            dns.append(&mut dns_config.options);
-        });
+        let dns = config
+            .dns_config
+            .as_ref()
+            .map_or_else(Vec::new, |dns_config| {
+                format_dns_config(
+                    &dns_config.servers,
+                    &dns_config.searches,
+                    &dns_config.options,
+                )
+            });
 
         Ok(SandboxRequest::CreateSandbox(Box::new(SandboxConfig {
             sandbox_id: from.sandbox_id.clone(),
@@ -87,6 +109,45 @@ impl TryFrom<sandbox_api::CreateSandboxRequest> for SandboxRequest {
             },
             shm_size: DEFAULT_SHM_SIZE,
         })))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_dns_config;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn format_complete_dns_config() {
+        assert_eq!(
+            format_dns_config(
+                &strings(&["10.96.0.10", "2001:db8::53"]),
+                &strings(&["example.svc.cluster.local", "svc.cluster.local"]),
+                &strings(&["ndots:5", "single-request-reopen"]),
+            ),
+            strings(&[
+                "nameserver 10.96.0.10",
+                "nameserver 2001:db8::53",
+                "search example.svc.cluster.local svc.cluster.local",
+                "options ndots:5 single-request-reopen",
+            ])
+        );
+    }
+
+    #[test]
+    fn format_empty_dns_config() {
+        assert!(format_dns_config(&[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn format_dns_config_omits_empty_servers_without_duplicates() {
+        assert_eq!(
+            format_dns_config(&strings(&["", "10.96.0.10"]), &[], &[]),
+            strings(&["nameserver 10.96.0.10"])
+        );
     }
 }
 
