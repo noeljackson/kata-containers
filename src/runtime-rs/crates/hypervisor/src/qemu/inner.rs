@@ -34,18 +34,25 @@ use nix::unistd::{setgid, setuid, Gid, Uid};
 use persist::sandbox_persist::Persist;
 use qapi_qmp::MigrationStatus;
 use std::cmp::Ordering;
+use std::collections::VecDeque;
 use std::convert::{TryFrom, TryInto};
 use std::fs;
 use std::io;
 use std::path::Path;
 use std::process::Stdio;
+use std::sync::{
+    atomic::{AtomicBool, Ordering as AtomicOrdering},
+    Arc,
+};
 use std::time::Duration;
 
 use tokio::time::sleep;
+use tokio::time::timeout;
 use tokio::time::Instant;
 use tokio::{
     io::{AsyncBufReadExt, BufReader},
     process::{Child, ChildStderr, Command},
+    task::JoinHandle,
 };
 use tokio::{
     net::UnixStream,
@@ -417,7 +424,6 @@ impl QemuInner {
 
         let mut qemu_process = command.stderr(Stdio::piped()).spawn()?;
         let stderr = qemu_process.stderr.take().unwrap();
-        self.qemu_process = Mutex::new(Some(qemu_process));
 
         info!(sl!(), "qemu process started");
 
@@ -426,11 +432,21 @@ impl QemuInner {
             .take()
             .ok_or_else(|| anyhow!("no exit notify"))?;
 
-        tokio::spawn(log_qemu_stderr(stderr, exit_notify));
+        let mut stderr_logger = tokio::spawn(log_qemu_stderr(stderr, exit_notify));
 
         let qmp_socket_path = get_qmp_socket_path(self.id.as_str());
+        let qmp_init_path = qmp_socket_path.clone();
+        let qmp_cancel = Arc::new(AtomicBool::new(false));
+        let qmp_init_cancel = qmp_cancel.clone();
+        let qmp_init =
+            tokio::task::spawn_blocking(move || Qmp::new(&qmp_init_path, &qmp_init_cancel));
+        let qmp_result =
+            wait_for_qmp_or_qemu_exit(&mut qemu_process, qmp_init, &qmp_cancel, &mut stderr_logger)
+                .await;
 
-        match Qmp::new(&qmp_socket_path) {
+        self.qemu_process = Mutex::new(Some(qemu_process));
+
+        match qmp_result {
             Ok(mut qmp) => {
                 if let Some(subchannel) = cmdline.take_ccw_subchannel() {
                     qmp.set_ccw_subchannel(subchannel);
@@ -1040,11 +1056,113 @@ async fn log_qemu_console(console: UnixStream) -> Result<()> {
     Ok(())
 }
 
-async fn log_qemu_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> Result<()> {
+const QEMU_EXIT_POLL_INTERVAL: Duration = Duration::from_millis(10);
+const QEMU_STDERR_CAPTURE_TIMEOUT: Duration = Duration::from_secs(2);
+const QEMU_STDERR_SUMMARY_MAX_LINES: usize = 128;
+const QEMU_STDERR_SUMMARY_MAX_CHARS: usize = 64 * 1024;
+
+#[derive(Debug, Default)]
+struct QemuStderrSummary {
+    lines: VecDeque<String>,
+    chars: usize,
+    truncated: bool,
+}
+
+impl QemuStderrSummary {
+    fn record(&mut self, line: &str) {
+        if self.lines.len() >= QEMU_STDERR_SUMMARY_MAX_LINES
+            || self.chars >= QEMU_STDERR_SUMMARY_MAX_CHARS
+        {
+            self.truncated = true;
+            return;
+        }
+
+        let remaining = QEMU_STDERR_SUMMARY_MAX_CHARS - self.chars;
+        let captured = line.chars().take(remaining).collect::<String>();
+        let captured_chars = captured.chars().count();
+
+        self.truncated |= captured_chars < line.chars().count();
+        self.chars += captured_chars;
+        self.lines.push_back(captured);
+    }
+
+    fn render(&self) -> String {
+        let mut rendered = if self.lines.is_empty() {
+            "<empty>".to_string()
+        } else {
+            self.lines.iter().cloned().collect::<Vec<_>>().join("\n")
+        };
+
+        if self.truncated {
+            rendered.push_str("\n<truncated>");
+        }
+
+        rendered
+    }
+}
+
+async fn qemu_stderr_after_exit(
+    stderr_logger: &mut JoinHandle<Result<QemuStderrSummary>>,
+) -> String {
+    match timeout(QEMU_STDERR_CAPTURE_TIMEOUT, stderr_logger).await {
+        Ok(Ok(Ok(summary))) => summary.render(),
+        Ok(Ok(Err(err))) => format!("<capture failed: {err:#}>"),
+        Ok(Err(err)) => format!("<capture task failed: {err}>"),
+        Err(_) => "<capture timed out>".to_string(),
+    }
+}
+
+async fn wait_for_qmp_or_qemu_exit<T>(
+    qemu_process: &mut Child,
+    mut qmp_init: JoinHandle<Result<T>>,
+    qmp_cancel: &AtomicBool,
+    stderr_logger: &mut JoinHandle<Result<QemuStderrSummary>>,
+) -> Result<T>
+where
+    T: Send + 'static,
+{
+    loop {
+        tokio::select! {
+            qmp_result = &mut qmp_init => {
+                let qmp = qmp_result.context("QMP init task failed")??;
+
+                if let Some(status) = qemu_process
+                    .try_wait()
+                    .context("poll QEMU process after QMP initialization")?
+                {
+                    let stderr = qemu_stderr_after_exit(stderr_logger).await;
+                    return Err(anyhow!(
+                        "QEMU exited before QMP initialization completed: {status}; stderr:\n{stderr}"
+                    ));
+                }
+
+                return Ok(qmp);
+            }
+            _ = sleep(QEMU_EXIT_POLL_INTERVAL) => {
+                if let Some(status) = qemu_process
+                    .try_wait()
+                    .context("poll QEMU process during QMP initialization")?
+                {
+                    qmp_cancel.store(true, AtomicOrdering::Release);
+                    let stderr = qemu_stderr_after_exit(stderr_logger).await;
+                    return Err(anyhow!(
+                        "QEMU exited before QMP initialization: {status}; stderr:\n{stderr}"
+                    ));
+                }
+            }
+        }
+    }
+}
+
+async fn log_qemu_stderr(
+    stderr: ChildStderr,
+    exit_notify: mpsc::Sender<()>,
+) -> Result<QemuStderrSummary> {
     info!(sl!(), "starting reading qemu stderr");
 
     let stderr_reader = BufReader::new(stderr);
     let mut stderr_lines = stderr_reader.lines();
+    let mut summary = QemuStderrSummary::default();
 
     while let Some(buffer) = stderr_lines
         .next_line()
@@ -1052,13 +1170,14 @@ async fn log_qemu_stderr(stderr: ChildStderr, exit_notify: mpsc::Sender<()>) -> 
         .context("next_line() failed on qemu stderr")?
     {
         info!(sl!(), "qemu stderr: {:?}", buffer);
+        summary.record(&buffer);
     }
 
     // Notfiy the waiter the process exit.
     let _ = exit_notify.try_send(());
 
     info!(sl!(), "finished reading qemu stderr");
-    Ok(())
+    Ok(summary)
 }
 
 use crate::device::DeviceType;
@@ -1590,5 +1709,58 @@ mod tests {
         let error = result.expect_err("credential failure must abort setup");
         assert!(format!("{error:#}").contains(expected_error));
         assert_eq!(calls.get(), expected_calls);
+    }
+
+    #[test]
+    fn test_qemu_stderr_summary_is_bounded() {
+        let mut summary = QemuStderrSummary::default();
+
+        for index in 0..=QEMU_STDERR_SUMMARY_MAX_LINES {
+            summary.record(&format!("qemu error {index}"));
+        }
+
+        assert_eq!(summary.lines.len(), QEMU_STDERR_SUMMARY_MAX_LINES);
+        assert!(summary.truncated);
+        assert!(summary.render().ends_with("<truncated>"));
+    }
+
+    #[test]
+    fn test_qmp_initialization_honors_cancellation() {
+        let cancelled = AtomicBool::new(true);
+
+        let error = Qmp::new("unused-qmp.sock", &cancelled)
+            .expect_err("cancelled QMP initialization must not try to connect");
+
+        assert!(format!("{error:#}").contains("QMP initialization cancelled"));
+    }
+
+    #[tokio::test]
+    async fn test_qemu_exit_fails_fast_and_preserves_stderr() {
+        let mut qemu_process = Command::new("sh")
+            .args(["-c", "printf 'fatal qemu startup\\n' >&2; exit 23"])
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stderr = qemu_process.stderr.take().unwrap();
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let mut stderr_logger = tokio::spawn(log_qemu_stderr(stderr, exit_notify));
+        let qmp_cancel = Arc::new(AtomicBool::new(false));
+        let qmp_init_cancel = qmp_cancel.clone();
+        let qmp_init = tokio::task::spawn_blocking(move || {
+            while !qmp_init_cancel.load(AtomicOrdering::Acquire) {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err::<(), anyhow::Error>(anyhow!("QMP initialization cancelled"))
+        });
+        let started = Instant::now();
+
+        let error =
+            wait_for_qmp_or_qemu_exit(&mut qemu_process, qmp_init, &qmp_cancel, &mut stderr_logger)
+                .await
+                .expect_err("an exited QEMU must reject startup");
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(format!("{error:#}").contains("exit status: 23"));
+        assert!(format!("{error:#}").contains("fatal qemu startup"));
     }
 }

@@ -27,6 +27,7 @@ use std::io::BufReader;
 use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use qapi_spec::Dictionary;
@@ -76,7 +77,7 @@ impl Debug for Qmp {
 }
 
 impl Qmp {
-    pub fn new(qmp_sock_path: &str) -> Result<Self> {
+    pub fn new(qmp_sock_path: &str, cancelled: &AtomicBool) -> Result<Self> {
         let try_new_once_fn = || -> Result<Qmp> {
             let stream = UnixStream::connect(qmp_sock_path)?;
 
@@ -104,6 +105,10 @@ impl Qmp {
         let mut last_err: Option<anyhow::Error> = None;
 
         while Instant::now() < deadline {
+            if cancelled.load(Ordering::Acquire) {
+                return Err(anyhow!("QMP initialization cancelled"));
+            }
+
             match try_new_once_fn() {
                 Ok(qmp) => return Ok(qmp),
                 Err(e) => {
