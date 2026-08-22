@@ -170,6 +170,36 @@ impl std::fmt::Debug for VirtSandbox {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum AgentStartOutcome {
+    Connected,
+    VmExited,
+}
+
+async fn wait_for_agent_start_or_vm_exit<F>(
+    agent_start: F,
+    mut exit_notify_rx: watch::Receiver<bool>,
+) -> Result<AgentStartOutcome>
+where
+    F: std::future::Future<Output = Result<()>>,
+{
+    if *exit_notify_rx.borrow() {
+        return Ok(AgentStartOutcome::VmExited);
+    }
+
+    tokio::select! {
+        biased;
+        changed = exit_notify_rx.changed() => {
+            changed.context("wait for sandbox VM exit during agent connection")?;
+            Ok(AgentStartOutcome::VmExited)
+        }
+        result = agent_start => {
+            result?;
+            Ok(AgentStartOutcome::Connected)
+        }
+    }
+}
+
 impl VirtSandbox {
     pub async fn new(
         sid: &str,
@@ -1114,10 +1144,26 @@ impl Sandbox for VirtSandbox {
             .get_agent_socket()
             .await
             .context("get agent socket")?;
-        self.agent
-            .start(&address)
+        let exit_notify_rx = self.exit_notify_tx.subscribe();
+        match wait_for_agent_start_or_vm_exit(self.agent.start(&address), exit_notify_rx)
             .await
-            .context(format!("connect to address {:?}", &address))?;
+            .context(format!("connect to address {:?}", &address))?
+        {
+            AgentStartOutcome::Connected => {}
+            AgentStartOutcome::VmExited => {
+                let exit_status = self
+                    .inner
+                    .read()
+                    .await
+                    .exit_info
+                    .as_ref()
+                    .map(|info| info.exit_status)
+                    .unwrap_or(255);
+                return Err(anyhow!(
+                    "sandbox VM exited before agent connected: exit_status={exit_status}"
+                ));
+            }
+        }
         self.set_agent_policy().await.context("set agent policy")?;
 
         self.resource_manager
@@ -1539,6 +1585,66 @@ impl Sandbox for VirtSandbox {
             .context("sandbox: failed to set policy")?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod agent_start_tests {
+    use super::{wait_for_agent_start_or_vm_exit, AgentStartOutcome};
+    use anyhow::anyhow;
+    use std::time::Duration;
+    use tokio::sync::watch;
+
+    #[tokio::test]
+    async fn agent_connection_wins_while_vm_is_running() {
+        let (_exit_notify_tx, exit_notify_rx) = watch::channel(false);
+
+        let outcome = wait_for_agent_start_or_vm_exit(async { Ok(()) }, exit_notify_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, AgentStartOutcome::Connected);
+    }
+
+    #[tokio::test]
+    async fn vm_exit_interrupts_a_pending_agent_connection() {
+        let (exit_notify_tx, exit_notify_rx) = watch::channel(false);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            exit_notify_tx.send(true).unwrap();
+        });
+
+        let outcome = wait_for_agent_start_or_vm_exit(std::future::pending(), exit_notify_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, AgentStartOutcome::VmExited);
+    }
+
+    #[tokio::test]
+    async fn preexisting_vm_exit_rejects_agent_connection() {
+        let (exit_notify_tx, exit_notify_rx) = watch::channel(false);
+        exit_notify_tx.send(true).unwrap();
+
+        let outcome = wait_for_agent_start_or_vm_exit(async { Ok(()) }, exit_notify_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, AgentStartOutcome::VmExited);
+    }
+
+    #[tokio::test]
+    async fn agent_connection_error_is_preserved() {
+        let (_exit_notify_tx, exit_notify_rx) = watch::channel(false);
+
+        let error = wait_for_agent_start_or_vm_exit(
+            async { Err(anyhow!("agent connection failed")) },
+            exit_notify_rx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "agent connection failed");
     }
 }
 
