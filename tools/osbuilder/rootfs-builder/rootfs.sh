@@ -902,8 +902,8 @@ EOF
 		# if /etc/resolv.conf is a link, it cannot be used for bind mount
 		rm -f "${dns_file}"
 	fi
-	info "Create /etc/resolv.conf file in rootfs if not exist"
-	touch "${dns_file}"
+	info "Create an empty /etc/resolv.conf file in rootfs"
+	: > "${dns_file}"
 
 	if [[ "${should_delete_unnecessary_files}" == "yes" ]]; then
 	    delete_unnecessary_files
