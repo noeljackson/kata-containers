@@ -662,7 +662,9 @@ impl QemuInner {
 
         if let Some(mut qemu_process) = qemu_process.take() {
             let status = qemu_process.wait().await?;
-            Ok(status.code().unwrap_or(0))
+            status
+                .code()
+                .ok_or_else(|| anyhow!("QEMU terminated without an exit code: {status}"))
         } else {
             Err(anyhow!("the process has been reaped"))
         }
@@ -1854,5 +1856,35 @@ mod tests {
         assert!(started.elapsed() < Duration::from_secs(1));
         assert!(format!("{error:#}").contains("exit status: 23"));
         assert!(format!("{error:#}").contains("fatal qemu startup"));
+    }
+
+    #[tokio::test]
+    async fn test_wait_vm_preserves_post_qmp_exit_status() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let mut qemu = QemuInner::new(exit_notify);
+        let qemu_process = Command::new("sh").args(["-c", "exit 23"]).spawn().unwrap();
+        qemu.qemu_process = Mutex::new(Some(qemu_process));
+
+        assert_eq!(qemu.wait_vm().await.unwrap(), 23);
+    }
+
+    #[tokio::test]
+    async fn test_wait_vm_rejects_signal_exit_as_success() {
+        let (exit_notify, _exit_waiter) = mpsc::channel(1);
+        let mut qemu = QemuInner::new(exit_notify);
+        let qemu_process = Command::new("sh")
+            .args(["-c", "kill -TERM $$"])
+            .spawn()
+            .unwrap();
+        qemu.qemu_process = Mutex::new(Some(qemu_process));
+
+        let error = qemu
+            .wait_vm()
+            .await
+            .expect_err("signal termination must not become exit status zero");
+
+        assert!(error
+            .to_string()
+            .contains("QEMU terminated without an exit code"));
     }
 }
