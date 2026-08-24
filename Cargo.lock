@@ -3708,7 +3708,6 @@ dependencies = [
  "common",
  "csv",
  "epoll",
- "futures",
  "http-body-util",
  "hyper 1.10.1",
  "hyper-util",

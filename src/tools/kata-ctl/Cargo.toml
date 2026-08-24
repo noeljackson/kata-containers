@@ -14,7 +14,6 @@ version = "0.0.1"
 anyhow.workspace = true
 base64.workspace = true
 clap = { features = ["cargo", "derive"], workspace = true }
-futures.workspace = true
 nix = { workspace = true }
 privdrop = "0.5.2"
 serde.workspace = true
@@ -47,7 +46,7 @@ hyper-util = { workspace = true }
 logging.workspace = true
 slog.workspace = true
 slog-scope.workspace = true
-tokio = { features = ["signal"], workspace = true }
+tokio = { features = ["rt-multi-thread", "signal", "time"], workspace = true }
 
 lazy_static.workspace = true
 procfs.workspace = true
