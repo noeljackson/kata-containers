@@ -5,8 +5,7 @@
 
 use crate::args::{DirectVolSubcommand, DirectVolumeCommand};
 
-use anyhow::{anyhow, Ok, Result};
-use futures::executor;
+use anyhow::{anyhow, Context, Ok, Result};
 use hyper::StatusCode;
 use kata_types::mount::{
     get_volume_mount_info, join_path, kata_direct_volume_root_path, parse_direct_volume_mount_info,
@@ -14,7 +13,8 @@ use kata_types::mount::{
 };
 use nix;
 use slog::{info, o};
-use std::fs;
+use std::{fs, future::Future};
+use tokio::runtime::Runtime;
 use url;
 
 use agent::ResizeVolumeRequest;
@@ -43,9 +43,9 @@ pub fn handle_direct_volume(vol_cmd: DirectVolumeCommand) -> Result<()> {
     let cmd_result: Option<String> = match command {
         DirectVolSubcommand::Add(args) => add(&args.volume_path, &args.mount_info)?,
         DirectVolSubcommand::Remove(args) => remove(&args.volume_path)?,
-        DirectVolSubcommand::Stats(args) => executor::block_on(stats(&args.volume_path))?,
+        DirectVolSubcommand::Stats(args) => run_async(stats(&args.volume_path))?,
         DirectVolSubcommand::Resize(args) => {
-            executor::block_on(resize(&args.volume_path, args.resize_size))?
+            run_async(resize(&args.volume_path, args.resize_size))?
         }
     };
     if let Some(cmd_result) = cmd_result {
@@ -53,6 +53,12 @@ pub fn handle_direct_volume(vol_cmd: DirectVolumeCommand) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn run_async<T>(future: impl Future<Output = Result<T>>) -> Result<T> {
+    Runtime::new()
+        .context("failed to create Tokio runtime for direct-volume operation")?
+        .block_on(future)
 }
 
 async fn resize(volume_path: &str, size: u64) -> Result<Option<String>> {
@@ -164,6 +170,20 @@ mod tests {
     use std::{collections::HashMap, fs};
     use tempfile::{tempdir, TempDir};
     use test_utils::skip_if_not_root;
+
+    #[test]
+    fn direct_volume_async_operation_has_a_tokio_time_driver() {
+        run_async(async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                tokio::time::sleep(std::time::Duration::from_millis(1)),
+            )
+            .await
+            .context("Tokio time driver did not run")?;
+            Ok(())
+        })
+        .unwrap();
+    }
 
     #[test]
     #[serial]
