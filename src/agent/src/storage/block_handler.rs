@@ -84,7 +84,8 @@ async fn handle_block_storage(
             &confidential_storage.key_uri,
         )
         .await?;
-        set_ownership(logger, storage)?;
+        set_ownership(logger, storage)
+            .context("apply fsGroup ownership to confidential block storage")?;
         new_device(storage.mount_point.clone())
     } else if options.has_ephemeral_encryption {
         let mkfs_opts = BLOCK_EMPTYDIR_EXT4_MKFS_OPTS.join(" ");
@@ -96,7 +97,8 @@ async fn handle_block_storage(
             &mkfs_opts,
         )
         .await?;
-        set_ownership(logger, storage)?;
+        set_ownership(logger, storage)
+            .context("apply fsGroup ownership to ephemeral encrypted block storage")?;
         new_device(storage.mount_point.clone())
     } else {
         if options.should_create_filesystem {
