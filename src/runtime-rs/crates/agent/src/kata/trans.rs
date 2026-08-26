@@ -15,7 +15,7 @@ use crate::{
     types::{
         ARPNeighbor, ARPNeighbors, AddArpNeighborRequest, AddSwapPathRequest, AddSwapRequest,
         AgentDetails, BlkioStats, BlkioStatsEntry, CgroupStats, CheckRequest, CloseStdinRequest,
-        ConfidentialStorage, ConfidentialStorageProfile, ContainerID, CopyFileRequest, CpuStats,
+        ConfidentialStorage, ConfidentialStorageAccess, ContainerID, CopyFileRequest, CpuStats,
         CpuUsage, CreateContainerRequest, CreateSandboxRequest, Device, Empty, ExecProcessRequest,
         FSGroup, FSGroupChangePolicy, GetIPTablesRequest, GetIPTablesResponse,
         GuestDetailsResponse, HealthCheckResponse, HugetlbStats, IPAddress, IPFamily, Interface,
@@ -123,16 +123,14 @@ impl From<Storage> for agent::Storage {
 
 impl From<ConfidentialStorage> for agent::ConfidentialStorage {
     fn from(from: ConfidentialStorage) -> Self {
-        let profile = match from.profile {
-            ConfidentialStorageProfile::Luks2IntegrityExt4 => {
-                agent::ConfidentialStorageProfile::Luks2IntegrityExt4
-            }
+        let requested_access = match from.requested_access {
+            ConfidentialStorageAccess::ReadOnly => agent::ConfidentialStorageAccess::ReadOnly,
+            ConfidentialStorageAccess::ReadWrite => agent::ConfidentialStorageAccess::ReadWrite,
         };
 
         Self {
-            profile: protobuf::EnumOrUnknown::new(profile),
-            volume_id: from.volume_id,
-            key_uri: from.key_uri,
+            manifest_uri: from.manifest_uri,
+            requested_access: protobuf::EnumOrUnknown::new(requested_access),
             ..Default::default()
         }
     }
@@ -939,5 +937,52 @@ impl From<AddSwapPathRequest> for agent::AddSwapPathRequest {
             path: from.path,
             ..Default::default()
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_transport_preserves_confidential_request_exactly() {
+        let storage = Storage {
+            driver: "blk".to_string(),
+            driver_options: Vec::new(),
+            source: "00/00".to_string(),
+            fs_type: "confidential-storage".to_string(),
+            options: Vec::new(),
+            mount_point: "/run/kata-containers/shared/containers/passthrough/confidential-test"
+                .to_string(),
+            shared: false,
+            fs_group: Some(FSGroup {
+                group_id: 3000,
+                group_change_policy: FSGroupChangePolicy::OnRootMismatch,
+            }),
+            confidential_storage: Some(ConfidentialStorage {
+                manifest_uri: "kbs:///tenant/storage-manifests/workspace-v1".to_string(),
+                requested_access: ConfidentialStorageAccess::ReadWrite,
+            }),
+        };
+
+        let wire: agent::Storage = storage.into();
+        let request = wire.confidential_storage.as_ref().unwrap();
+
+        assert_eq!(
+            request.manifest_uri,
+            "kbs:///tenant/storage-manifests/workspace-v1"
+        );
+        assert_eq!(
+            request.requested_access.enum_value().unwrap(),
+            agent::ConfidentialStorageAccess::ReadWrite
+        );
+        assert_eq!(wire.fs_group.group_id, 3000);
+        assert_eq!(
+            wire.fs_group.group_change_policy.enum_value().unwrap(),
+            protocols::types::FSGroupChangePolicy::OnRootMismatch
+        );
+        assert!(wire.driver_options.is_empty());
+        assert!(wire.options.is_empty());
+        assert!(!wire.shared);
     }
 }
