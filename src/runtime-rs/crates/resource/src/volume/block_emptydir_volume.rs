@@ -127,6 +127,7 @@ impl BlockEmptyDirVolume {
             sid,
             "ext4",
             Some(&[]),
+            None,
         )
         .await
         .context("handle block emptyDir block volume")?;

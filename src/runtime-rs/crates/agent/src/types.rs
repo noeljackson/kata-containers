@@ -35,16 +35,16 @@ pub struct FSGroup {
     pub group_change_policy: FSGroupChangePolicy,
 }
 
-#[derive(Debug, PartialEq, Clone)]
-pub enum ConfidentialStorageProfile {
-    Luks2IntegrityExt4,
+#[derive(Debug, PartialEq, Clone, Copy)]
+pub enum ConfidentialStorageAccess {
+    ReadOnly,
+    ReadWrite,
 }
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct ConfidentialStorage {
-    pub profile: ConfidentialStorageProfile,
-    pub volume_id: String,
-    pub key_uri: String,
+    pub manifest_uri: String,
+    pub requested_access: ConfidentialStorageAccess,
 }
 
 #[derive(PartialEq, Clone, Default)]

@@ -14,7 +14,8 @@ use hypervisor::{
     BlockConfigModern, BlockDeviceAio,
 };
 use kata_types::mount::{
-    DirectVolumeMountInfo, KATA_CONFIDENTIAL_STORAGE_PROFILE_LUKS2_INTEGRITY_EXT4,
+    confidential_storage_mount_name, ConfidentialStorageAccess, DirectVolumeMountInfo,
+    KATA_CONFIDENTIAL_STORAGE_FS_TYPE,
 };
 use nix::sys::{stat, stat::SFlag};
 use oci_spec::runtime as oci;
@@ -96,6 +97,8 @@ impl RawblockVolume {
                     false
                 }));
 
+        validate_confidential_access(mount_info, read_only)?;
+
         let block_config = BlockConfigModern {
             path_on_host: mount_info.device.clone(),
             is_readonly: read_only,
@@ -113,6 +116,10 @@ impl RawblockVolume {
             .await
             .context("do handle device failed.")?;
 
+        let stable_mount_name = mount_info
+            .validated_confidential_storage()?
+            .map(|request| confidential_storage_mount_name(&request.manifest_uri))
+            .transpose()?;
         let mut block_volume = handle_block_volume(
             device_info,
             m,
@@ -120,6 +127,7 @@ impl RawblockVolume {
             sid,
             &mount_info.fs_type,
             Some(&mount_info.options),
+            stable_mount_name.as_deref(),
         )
         .await
         .context("do handle block volume failed")?;
@@ -135,6 +143,22 @@ impl RawblockVolume {
     }
 }
 
+fn validate_confidential_access(mount_info: &DirectVolumeMountInfo, read_only: bool) -> Result<()> {
+    let Some(request) = mount_info.validated_confidential_storage()? else {
+        return Ok(());
+    };
+
+    match (request.requested_access, read_only) {
+        (ConfidentialStorageAccess::ReadWrite, false) => Ok(()),
+        (ConfidentialStorageAccess::ReadWrite, true) => Err(anyhow!(
+            "confidential storage requested readWrite access for a read-only device"
+        )),
+        (ConfidentialStorageAccess::ReadOnly, _) => Err(anyhow!(
+            "confidential storage readOnly access is not supported"
+        )),
+    }
+}
+
 fn configure_confidential_storage(
     storage: &mut agent::Storage,
     mount_info: &DirectVolumeMountInfo,
@@ -143,14 +167,19 @@ fn configure_confidential_storage(
         return Ok(());
     };
 
-    if request.profile != KATA_CONFIDENTIAL_STORAGE_PROFILE_LUKS2_INTEGRITY_EXT4 {
-        return Err(anyhow!("unsupported confidential storage profile"));
+    if storage.fs_type != KATA_CONFIDENTIAL_STORAGE_FS_TYPE {
+        return Err(anyhow!(
+            "confidential storage discriminator was not preserved"
+        ));
     }
 
+    let requested_access = match request.requested_access {
+        ConfidentialStorageAccess::ReadOnly => agent::ConfidentialStorageAccess::ReadOnly,
+        ConfidentialStorageAccess::ReadWrite => agent::ConfidentialStorageAccess::ReadWrite,
+    };
     storage.confidential_storage = Some(agent::ConfidentialStorage {
-        profile: agent::ConfidentialStorageProfile::Luks2IntegrityExt4,
-        volume_id: request.volume_id.clone(),
-        key_uri: request.key_uri.clone(),
+        manifest_uri: request.manifest_uri.clone(),
+        requested_access,
     });
 
     if let Some(group_id) = mount_info.metadata.get("fsGroup") {
@@ -171,14 +200,47 @@ fn configure_confidential_storage(
     Ok(())
 }
 
+#[async_trait]
+impl Volume for RawblockVolume {
+    fn get_volume_mount(&self) -> Result<Vec<oci::Mount>> {
+        Ok(vec![self.mount.clone()])
+    }
+
+    fn get_storage(&self) -> Result<Vec<agent::Storage>> {
+        let s = if let Some(s) = self.storage.as_ref() {
+            vec![s.clone()]
+        } else {
+            vec![]
+        };
+
+        Ok(s)
+    }
+
+    async fn cleanup(&self, device_manager: &RwLock<DeviceManager>) -> Result<()> {
+        // CDH keeps a persistent confidential mapper alive for the sandbox. Detaching its
+        // backing device during container cleanup would leave that mapper bound to a device
+        // that no longer exists. Keep the device attached until the sandbox VM is destroyed.
+        if self.device_lifetime == DeviceLifetime::Sandbox {
+            return Ok(());
+        }
+
+        device_manager
+            .write()
+            .await
+            .try_remove_device(&self.device_id)
+            .await
+    }
+
+    fn get_device_id(&self) -> Result<Option<String>> {
+        Ok(Some(self.device_id.clone()))
+    }
+}
+
 #[cfg(test)]
-mod tests {
+mod confidential_storage_tests {
     use std::collections::HashMap;
 
-    use kata_types::mount::{
-        ConfidentialStorage, KATA_CONFIDENTIAL_STORAGE_FS_TYPE,
-        KATA_CONFIDENTIAL_STORAGE_VOLUME_TYPE,
-    };
+    use kata_types::mount::{ConfidentialStorage, KATA_CONFIDENTIAL_STORAGE_VOLUME_TYPE};
 
     use super::*;
 
@@ -190,15 +252,14 @@ mod tests {
             metadata: HashMap::new(),
             options: Vec::new(),
             confidential_storage: Some(ConfidentialStorage {
-                profile: KATA_CONFIDENTIAL_STORAGE_PROFILE_LUKS2_INTEGRITY_EXT4.to_string(),
-                volume_id: "tenant/workload/volume".to_string(),
-                key_uri: "kbs:///tenant/storage/key".to_string(),
+                manifest_uri: "kbs:///tenant/storage-manifests/volume-1-v1".to_string(),
+                requested_access: ConfidentialStorageAccess::ReadWrite,
             }),
         }
     }
 
     #[test]
-    fn configure_confidential_storage_request() {
+    fn configures_typed_confidential_storage_request() {
         let mut mount_info = confidential_mount_info();
         mount_info
             .metadata
@@ -207,16 +268,18 @@ mod tests {
             "fsGroupChangePolicy".to_string(),
             "OnRootMismatch".to_string(),
         );
-        let mut storage = agent::Storage::default();
+        let mut storage = agent::Storage {
+            fs_type: KATA_CONFIDENTIAL_STORAGE_FS_TYPE.to_string(),
+            ..Default::default()
+        };
 
         configure_confidential_storage(&mut storage, &mount_info).unwrap();
 
         assert_eq!(
             storage.confidential_storage,
             Some(agent::ConfidentialStorage {
-                profile: agent::ConfidentialStorageProfile::Luks2IntegrityExt4,
-                volume_id: "tenant/workload/volume".to_string(),
-                key_uri: "kbs:///tenant/storage/key".to_string(),
+                manifest_uri: "kbs:///tenant/storage-manifests/volume-1-v1".to_string(),
+                requested_access: agent::ConfidentialStorageAccess::ReadWrite,
             })
         );
         assert_eq!(
@@ -229,7 +292,12 @@ mod tests {
     }
 
     #[test]
-    fn configure_confidential_storage_rejects_downgrade() {
+    fn rejects_read_only_transport_for_read_write_request() {
+        assert!(validate_confidential_access(&confidential_mount_info(), true).is_err());
+    }
+
+    #[test]
+    fn rejects_plaintext_discriminator_downgrade() {
         let mut mount_info = confidential_mount_info();
         mount_info.fs_type = "ext4".to_string();
         let mut storage = agent::Storage::default();
@@ -259,43 +327,5 @@ mod tests {
             device_lifetime(&mount_info).unwrap(),
             DeviceLifetime::Container
         );
-    }
-}
-
-#[async_trait]
-impl Volume for RawblockVolume {
-    fn get_volume_mount(&self) -> Result<Vec<oci::Mount>> {
-        Ok(vec![self.mount.clone()])
-    }
-
-    fn get_storage(&self) -> Result<Vec<agent::Storage>> {
-        let s = if let Some(s) = self.storage.as_ref() {
-            vec![s.clone()]
-        } else {
-            vec![]
-        };
-
-        Ok(s)
-    }
-
-    async fn cleanup(&self, device_manager: &RwLock<DeviceManager>) -> Result<()> {
-        // CDH keeps a persistent confidential mapper alive for the sandbox. Detaching its
-        // backing device when one container is cleaned up leaves that mapper bound to a
-        // device that no longer exists. A later container retry can then hot-plug the same
-        // volume under a different guest device number and must be rejected by CDH's
-        // backing-device check. Keep the device attached until the sandbox VM is destroyed.
-        if self.device_lifetime == DeviceLifetime::Sandbox {
-            return Ok(());
-        }
-
-        device_manager
-            .write()
-            .await
-            .try_remove_device(&self.device_id)
-            .await
-    }
-
-    fn get_device_id(&self) -> Result<Option<String>> {
-        Ok(Some(self.device_id.clone()))
     }
 }
