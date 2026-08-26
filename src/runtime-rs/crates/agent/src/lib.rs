@@ -16,7 +16,7 @@ pub mod types;
 pub use types::{
     ARPNeighbor, ARPNeighbors, AddArpNeighborRequest, AddSwapPathRequest, AddSwapRequest,
     BlkioStatsEntry, CheckRequest, CloseStdinRequest, ConfidentialStorage,
-    ConfidentialStorageProfile, ContainerID, ContainerProcessID, CopyFileRequest,
+    ConfidentialStorageAccess, ContainerID, ContainerProcessID, CopyFileRequest,
     CreateContainerRequest, CreateSandboxRequest, Empty, ExecProcessRequest, FSGroup,
     FSGroupChangePolicy, GetDiagnosticDataRequest, GetDiagnosticDataResponse,
     GetGuestDetailsRequest, GetIPTablesRequest, GetIPTablesResponse, GuestDetailsResponse,
