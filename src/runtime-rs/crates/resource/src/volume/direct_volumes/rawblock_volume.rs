@@ -31,6 +31,21 @@ pub(crate) struct RawblockVolume {
     storage: Option<agent::Storage>,
     mount: oci::Mount,
     device_id: String,
+    device_lifetime: DeviceLifetime,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeviceLifetime {
+    Container,
+    Sandbox,
+}
+
+fn device_lifetime(mount_info: &DirectVolumeMountInfo) -> Result<DeviceLifetime> {
+    if mount_info.validated_confidential_storage()?.is_some() {
+        Ok(DeviceLifetime::Sandbox)
+    } else {
+        Ok(DeviceLifetime::Container)
+    }
 }
 
 /// RawblockVolume for raw block volume
@@ -42,7 +57,7 @@ impl RawblockVolume {
         read_only: bool,
         sid: &str,
     ) -> Result<Self> {
-        mount_info.validated_confidential_storage()?;
+        let device_lifetime = device_lifetime(mount_info)?;
         let blkdev_info = get_block_device_info(d).await;
 
         // check volume type
@@ -115,6 +130,7 @@ impl RawblockVolume {
             storage: Some(block_volume.0),
             mount: block_volume.1,
             device_id: block_volume.2,
+            device_lifetime,
         })
     }
 }
@@ -221,6 +237,29 @@ mod tests {
         assert!(configure_confidential_storage(&mut storage, &mount_info).is_err());
         assert!(storage.confidential_storage.is_none());
     }
+
+    #[test]
+    fn confidential_device_lifetime_is_sandbox_scoped() {
+        assert_eq!(
+            device_lifetime(&confidential_mount_info()).unwrap(),
+            DeviceLifetime::Sandbox
+        );
+    }
+
+    #[test]
+    fn ordinary_direct_volume_device_lifetime_is_container_scoped() {
+        let mount_info = DirectVolumeMountInfo {
+            volume_type: KATA_DIRECT_VOLUME_TYPE.to_string(),
+            device: "/dev/sda".to_string(),
+            fs_type: "ext4".to_string(),
+            ..Default::default()
+        };
+
+        assert_eq!(
+            device_lifetime(&mount_info).unwrap(),
+            DeviceLifetime::Container
+        );
+    }
 }
 
 #[async_trait]
@@ -240,6 +279,15 @@ impl Volume for RawblockVolume {
     }
 
     async fn cleanup(&self, device_manager: &RwLock<DeviceManager>) -> Result<()> {
+        // CDH keeps a persistent confidential mapper alive for the sandbox. Detaching its
+        // backing device when one container is cleaned up leaves that mapper bound to a
+        // device that no longer exists. A later container retry can then hot-plug the same
+        // volume under a different guest device number and must be rejected by CDH's
+        // backing-device check. Keep the device attached until the sandbox VM is destroyed.
+        if self.device_lifetime == DeviceLifetime::Sandbox {
+            return Ok(());
+        }
+
         device_manager
             .write()
             .await
