@@ -770,21 +770,23 @@ fn mount_from(
 
     let mount_source = m.source().as_ref().unwrap().display().to_string();
     let src = if mount_typ == "bind" {
-        let src = fs::canonicalize(&mount_source)?;
+        let src = fs::canonicalize(&mount_source).context("resolve bind mount source")?;
         let dir = if src.is_dir() {
             Path::new(&dest)
         } else {
             Path::new(&dest).parent().unwrap()
         };
 
-        fs::create_dir_all(dir).inspect_err(|e| {
-            log_child!(
-                cfd_log,
-                "create dir {}: {}",
-                dir.to_str().unwrap(),
-                e.to_string()
-            )
-        })?;
+        fs::create_dir_all(dir)
+            .inspect_err(|e| {
+                log_child!(
+                    cfd_log,
+                    "create dir {}: {}",
+                    dir.to_str().unwrap(),
+                    e.to_string()
+                )
+            })
+            .context("create bind mount destination directory")?;
 
         // make sure file exists so we can bind over it
         if !src.is_dir() {
@@ -801,11 +803,12 @@ fn mount_from(
                         e
                     );
                     e
-                })?;
+                })
+                .context("create bind mount destination file")?;
         }
         src.to_str().unwrap().to_string()
     } else {
-        let _ = fs::create_dir_all(&dest);
+        fs::create_dir_all(&dest).context("create mount destination directory")?;
         if mount_typ == "cgroup2" {
             "cgroup2".to_string()
         } else {
@@ -813,8 +816,9 @@ fn mount_from(
         }
     };
 
-    let _ = stat::stat(dest.as_str())
-        .inspect_err(|e| log_child!(cfd_log, "dest stat error. {}: {:?}", dest.as_str(), e))?;
+    stat::stat(dest.as_str())
+        .inspect_err(|e| log_child!(cfd_log, "dest stat error. {}: {:?}", dest.as_str(), e))
+        .context("inspect mount destination")?;
 
     // Set the SELinux context for the mounts
     let mut use_xattr = false;
@@ -1440,6 +1444,8 @@ mod tests {
             make_source_directory: bool,
             // if true, a file will be created at path in source
             make_source_file: bool,
+            // if true, a file blocks creation of the destination directory
+            make_destination_file: bool,
         }
 
         impl Default for TestData<'_> {
@@ -1452,6 +1458,7 @@ mod tests {
                     error_contains: "",
                     make_source_directory: true,
                     make_source_file: false,
+                    make_destination_file: false,
                 }
             }
         }
@@ -1475,13 +1482,19 @@ mod tests {
             TestData {
                 r#type: "bind",
                 make_source_directory: false,
-                error_contains: &format!("{}", std::io::Error::from_raw_os_error(libc::ENOENT)),
+                error_contains: "resolve bind mount source",
                 ..Default::default()
             },
             TestData {
                 r#type: "bind",
                 make_source_directory: false,
                 make_source_file: true,
+                ..Default::default()
+            },
+            TestData {
+                r#type: "bind",
+                error_contains: "create bind mount destination directory",
+                make_destination_file: true,
                 ..Default::default()
             },
         ];
@@ -1497,6 +1510,9 @@ mod tests {
                 std::fs::create_dir_all(&source_path).unwrap();
             } else if d.make_source_file {
                 std::fs::write(&source_path, []).unwrap();
+            }
+            if d.make_destination_file {
+                std::fs::write(tempdir.path().join(d.destination), []).unwrap();
             }
 
             let mut mount = oci::Mount::default();

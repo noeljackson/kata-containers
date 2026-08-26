@@ -459,12 +459,15 @@ pub fn set_ownership(logger: &Logger, storage: &Storage) -> Result<()> {
     let fs_group = storage.fs_group();
     let read_only = storage.options.contains(&String::from("ro"));
     let mount_path = Path::new(&storage.mount_point);
-    let metadata = mount_path.metadata().inspect_err(|err| {
-        error!(logger, "failed to obtain metadata for mount path";
-            "mount-path" => mount_path.to_str(),
-            "error" => err.to_string(),
-        )
-    })?;
+    let metadata = mount_path
+        .metadata()
+        .inspect_err(|err| {
+            error!(logger, "failed to obtain metadata for mount path";
+                "mount-path" => mount_path.to_str(),
+                "error" => err.to_string(),
+            )
+        })
+        .context("inspect volume mount point before fsGroup ownership")?;
 
     if fs_group.group_change_policy == FSGroupChangePolicy::OnRootMismatch.into()
         && metadata.gid() == fs_group.group_id
@@ -507,8 +510,11 @@ pub fn recursive_ownership_change(
 ) -> Result<()> {
     let mut mask = if read_only { RO_MASK } else { RW_MASK };
     if path.is_dir() {
-        for entry in fs::read_dir(path)? {
-            recursive_ownership_change(entry?.path().as_path(), uid, gid, read_only)?;
+        for entry in
+            fs::read_dir(path).context("read directory during recursive fsGroup ownership")?
+        {
+            let entry = entry.context("read child entry during recursive fsGroup ownership")?;
+            recursive_ownership_change(entry.path().as_path(), uid, gid, read_only)?;
         }
         mask |= EXEC_MASK;
         mask |= MODE_SETGID;
@@ -521,14 +527,18 @@ pub fn recursive_ownership_change(
         return Ok(());
     }
 
-    nix::unistd::chown(path, uid, gid)?;
+    nix::unistd::chown(path, uid, gid)
+        .context("change ownership during recursive fsGroup ownership")?;
 
     if gid.is_some() {
-        let metadata = path.metadata()?;
+        let metadata = path
+            .metadata()
+            .context("inspect path after recursive fsGroup ownership")?;
         let mut permission = metadata.permissions();
         let target_mode = metadata.mode() | mask;
         permission.set_mode(target_mode);
-        fs::set_permissions(path, permission)?;
+        fs::set_permissions(path, permission)
+            .context("change permissions during recursive fsGroup ownership")?;
     }
 
     Ok(())
@@ -868,6 +878,19 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn test_recursive_ownership_change_reports_operation() {
+        let tempdir = tempdir().unwrap();
+        let missing = tempdir.path().join("missing");
+
+        let error = recursive_ownership_change(&missing, None, Some(Gid::from_raw(3000)), false)
+            .unwrap_err();
+
+        assert!(
+            format!("{error:#}").contains("change ownership during recursive fsGroup ownership")
+        );
     }
 
     #[tokio::test]
