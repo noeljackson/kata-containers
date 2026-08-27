@@ -770,6 +770,26 @@ pub fn add_volume_mount_info(volume_path: &str, mount_info: &DirectVolumeMountIn
     Ok(())
 }
 
+/// Associate a direct volume with the sandbox that consumes it so `kata-ctl`
+/// can route stats and lifecycle requests to the correct runtime-rs shim.
+#[cfg(feature = "safe-path")]
+pub fn record_direct_volume_sandbox_id(volume_path: &str, sandbox_id: &str) -> Result<()> {
+    if sandbox_id.is_empty() || sandbox_id == "." || sandbox_id == ".." || sandbox_id.contains('/')
+    {
+        return Err(anyhow!("invalid direct-volume sandbox ID"));
+    }
+
+    let volume_path = join_path(kata_direct_volume_root_path().as_str(), volume_path)?;
+    let marker = safe_path::scoped_join(&volume_path, sandbox_id)?;
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&marker)
+        .with_context(|| format!("failed to record direct-volume sandbox ID at {marker:?}"))?;
+    Ok(())
+}
+
 /// Returns `true` if a `mountInfo.json` exists for the given `volume_path`.
 #[cfg(feature = "safe-path")]
 pub fn is_volume_mounted(volume_path: &str) -> bool {
@@ -853,6 +873,11 @@ pub fn adjust_rootfs_mounts() -> Result<Vec<Mount>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_kata_guest_sandbox_dir() {
+        assert_eq!(kata_guest_sandbox_dir(), DEFAULT_KATA_GUEST_SANDBOX_DIR);
+    }
 
     const CONFIDENTIAL_MOUNT_INFO: &str = r#"{
         "volume-type":"directvol",
@@ -963,11 +988,6 @@ mod tests {
             "legacy-extension":"preserved-by-older-writers"
         }"#;
         assert!(parse_direct_volume_mount_info(value).is_ok());
-    }
-
-    #[test]
-    fn test_kata_guest_sandbox_dir() {
-        assert_eq!(kata_guest_sandbox_dir(), DEFAULT_KATA_GUEST_SANDBOX_DIR);
     }
 
     #[test]
