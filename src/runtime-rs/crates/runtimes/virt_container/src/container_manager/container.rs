@@ -35,6 +35,7 @@ use super::{
     process::{Process, ProcessWatcher},
     ContainerInner,
 };
+use crate::container_manager::confidential_volume::build_confidential_volume_plan;
 use crate::container_manager::{is_termination_signal, logger_with_process};
 
 pub struct Exec {
@@ -208,8 +209,18 @@ impl Container {
             .resource_manager
             .handler_devices(&config.container_id, linux)
             .await?;
+        let confidential_volume_plan =
+            build_confidential_volume_plan(&mut spec, &container_devices)
+                .context("build confidential raw-block volume plan")?;
+        let container_devices = confidential_volume_plan
+            .consume_devices(&mut spec, container_devices)
+            .context("consume confidential raw-block devices")?;
         let devices_agent = annotate_container_devices(&mut spec, container_devices)
             .context("annotate container devices failed")?;
+        storages.extend(confidential_volume_plan.storages);
+        spec.mounts_mut()
+            .get_or_insert_with(Vec::new)
+            .extend(confidential_volume_plan.mounts);
 
         // update vcpus, mems and host cgroups
         let resources = self
