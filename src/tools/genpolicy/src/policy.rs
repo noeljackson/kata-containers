@@ -1674,6 +1674,22 @@ mod tests {
         volume_source: &str,
         container_contract: &str,
     ) -> Box<dyn yaml::K8sResource + Sync + Send> {
+        confidential_pod_with_fs_group(
+            annotation,
+            volume_source,
+            container_contract,
+            3000,
+            "/dev/confidential-workspace",
+        )
+    }
+
+    fn confidential_pod_with_fs_group(
+        annotation: &str,
+        volume_source: &str,
+        container_contract: &str,
+        fs_group: u32,
+        device_path: &str,
+    ) -> Box<dyn yaml::K8sResource + Sync + Send> {
         let document = format!(
             r#"apiVersion: v1
 kind: Pod
@@ -1683,14 +1699,14 @@ metadata:
     {KATA_ANNO_CONFIDENTIAL_VOLUME}: '{annotation}'
 spec:
   securityContext:
-    fsGroup: 3000
+    fsGroup: {fs_group}
     fsGroupChangePolicy: OnRootMismatch
   containers:
   - name: workspace
     image: example.invalid/workspace:latest
     volumeDevices:
     - name: workspace
-      devicePath: /dev/confidential-workspace
+      devicePath: {device_path}
 {container_contract}
   volumes:
   - name: workspace
@@ -1814,6 +1830,60 @@ spec:
             consumed_device_paths,
             BTreeSet::from(["/dev/confidential-workspace".to_string()])
         );
+    }
+
+    #[test]
+    fn confidential_policy_compiler_matches_shared_contract_fixture() {
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/policy/testdata/confidential-storage-contract-v1.json"
+        ))
+        .expect("shared confidential-storage contract fixture must parse");
+        let annotation = serde_json::to_string(&fixture["declaration"]).unwrap();
+        let resource = confidential_pod_with_fs_group(
+            &annotation,
+            "    persistentVolumeClaim:\n      claimName: workspace",
+            "",
+            1000,
+            "/dev/codewire-workspace",
+        );
+        let container = &resource.get_containers()[0];
+        let mut mounts = Vec::new();
+
+        let (policies, consumed_device_paths) =
+            confidential_volume_policies(resource.as_ref(), container, &mut mounts).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&policies).unwrap(),
+            fixture["expected_genpolicy"],
+            "genpolicy must compile the shared declaration into the shared authorization"
+        );
+        assert_eq!(
+            consumed_device_paths,
+            BTreeSet::from(["/dev/codewire-workspace".to_string()])
+        );
+        assert_eq!(
+            mounts
+                .iter()
+                .map(|mount| mount.destination.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["/home/codewire", "/workspace"])
+        );
+
+        for invalid in fixture["invalid_declarations"].as_array().unwrap() {
+            let annotation = serde_json::to_string(&invalid["value"]).unwrap();
+            let resource = confidential_pod_with_fs_group(
+                &annotation,
+                "    persistentVolumeClaim:\n      claimName: workspace",
+                "",
+                1000,
+                "/dev/codewire-workspace",
+            );
+            assert!(
+                confidential_volume_declarations(resource.as_ref()).is_err(),
+                "shared invalid declaration {:?} was accepted",
+                invalid["name"].as_str().unwrap()
+            );
+        }
     }
 
     #[test]

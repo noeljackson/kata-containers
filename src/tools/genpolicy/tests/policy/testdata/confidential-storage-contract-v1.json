@@ -1,0 +1,495 @@
+{
+  "schema_version": 1,
+  "declaration": {
+    "workspace": {
+      "devicePath": "/dev/codewire-workspace",
+      "manifestUri": "kbs:///default/codewire-storage-manifests/sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "access": "readWrite",
+      "fsGroup": 1000,
+      "fsGroupChangePolicy": "OnRootMismatch",
+      "mounts": {
+        "workspace": [
+          "/home/codewire",
+          "/workspace"
+        ]
+      }
+    }
+  },
+  "expected_genpolicy": [
+    {
+      "volume_name": "workspace",
+      "manifest_uri": "kbs:///default/codewire-storage-manifests/sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "requested_access": 2,
+      "mount_destination": "/home/codewire",
+      "mount_source": "^/run/kata-containers/shared/containers/passthrough/confidential-ba9f00629c25eefdd46071f3f8c71ed65030465492722ae83180567c015b446c$",
+      "mount_type": "bind",
+      "mount_options": [
+        "rbind",
+        "rprivate",
+        "rw"
+      ],
+      "storage_fstype": "confidential-storage",
+      "filesystem_type": "ext4",
+      "filesystem_options": [
+        "nodev",
+        "nosuid",
+        "rw"
+      ],
+      "fs_group": {
+        "group_id": 1000,
+        "group_change_policy": 1
+      }
+    },
+    {
+      "volume_name": "workspace",
+      "manifest_uri": "kbs:///default/codewire-storage-manifests/sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+      "requested_access": 2,
+      "mount_destination": "/workspace",
+      "mount_source": "^/run/kata-containers/shared/containers/passthrough/confidential-ba9f00629c25eefdd46071f3f8c71ed65030465492722ae83180567c015b446c$",
+      "mount_type": "bind",
+      "mount_options": [
+        "rbind",
+        "rprivate",
+        "rw"
+      ],
+      "storage_fstype": "confidential-storage",
+      "filesystem_type": "ext4",
+      "filesystem_options": [
+        "nodev",
+        "nosuid",
+        "rw"
+      ],
+      "fs_group": {
+        "group_id": 1000,
+        "group_change_policy": 1
+      }
+    }
+  ],
+  "workload_request": {
+    "OCI": {
+      "Annotations": {
+        "io.kubernetes.cri.container-name": "workspace",
+        "io.kubernetes.cri.image-name": "ghcr.io/codewiresh/workspace:golden"
+      },
+      "Linux": {
+        "Devices": []
+      },
+      "Mounts": [
+        {
+          "destination": "/home/codewire",
+          "source": "/run/kata-containers/shared/containers/passthrough/confidential-ba9f00629c25eefdd46071f3f8c71ed65030465492722ae83180567c015b446c",
+          "type_": "bind",
+          "options": [
+            "rbind",
+            "rprivate",
+            "rw"
+          ]
+        },
+        {
+          "destination": "/workspace",
+          "source": "/run/kata-containers/shared/containers/passthrough/confidential-ba9f00629c25eefdd46071f3f8c71ed65030465492722ae83180567c015b446c",
+          "type_": "bind",
+          "options": [
+            "rbind",
+            "rprivate",
+            "rw"
+          ]
+        }
+      ]
+    },
+    "devices": [],
+    "storages": [
+      {
+        "driver": "blk",
+        "driver_options": [],
+        "fstype": "confidential-storage",
+        "fs_group": {
+          "group_id": 1000,
+          "group_change_policy": 1
+        },
+        "mount_point": "/run/kata-containers/shared/containers/passthrough/confidential-ba9f00629c25eefdd46071f3f8c71ed65030465492722ae83180567c015b446c",
+        "options": [],
+        "shared": false,
+        "source": "00/00",
+        "confidential_storage": {
+          "manifest_uri": "kbs:///default/codewire-storage-manifests/sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "requested_access": 2
+        }
+      }
+    ]
+  },
+  "sandbox_request": {
+    "OCI": {
+      "Annotations": {
+        "io.katacontainers.pkg.oci.container_type": "pod_sandbox",
+        "io.kubernetes.cri.container-type": "sandbox",
+        "io.kubernetes.cri.podsandbox.image-name": "registry.k8s.io/pause:3.10"
+      },
+      "Linux": {
+        "Devices": []
+      },
+      "Mounts": [
+        {
+          "destination": "/proc",
+          "source": "proc",
+          "type_": "proc",
+          "options": [
+            "nosuid",
+            "noexec",
+            "nodev"
+          ]
+        }
+      ]
+    },
+    "devices": [],
+    "storages": [
+      {
+        "driver": "image_guest_pull",
+        "driver_options": [],
+        "fstype": "overlay",
+        "fs_group": null,
+        "mount_point": "/run/kata-containers/sandbox/rootfs",
+        "options": [],
+        "shared": false,
+        "source": "pause"
+      }
+    ]
+  },
+  "cases": [
+    {
+      "name": "valid-blk-workload",
+      "base": "workload",
+      "allowed": true,
+      "patches": []
+    },
+    {
+      "name": "valid-scsi-workload",
+      "base": "workload",
+      "allowed": true,
+      "patches": [
+        {
+          "path": "/storages/0/driver",
+          "value": "scsi"
+        },
+        {
+          "path": "/storages/0/source",
+          "value": "0:0"
+        }
+      ]
+    },
+    {
+      "name": "canonical-cri-sandbox",
+      "base": "sandbox",
+      "allowed": true,
+      "patches": []
+    },
+    {
+      "name": "sandbox-cannot-activate-confidential-storage",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/OCI/Annotations",
+          "value": {
+            "io.katacontainers.pkg.oci.container_type": "pod_sandbox",
+            "io.kubernetes.cri.container-type": "sandbox",
+            "io.kubernetes.cri.podsandbox.image-name": "registry.k8s.io/pause:3.10"
+          }
+        }
+      ]
+    },
+    {
+      "name": "sandbox-cannot-receive-protected-mount",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/OCI/Annotations",
+          "value": {
+            "io.katacontainers.pkg.oci.container_type": "pod_sandbox",
+            "io.kubernetes.cri.container-type": "sandbox",
+            "io.kubernetes.cri.podsandbox.image-name": "registry.k8s.io/pause:3.10"
+          }
+        },
+        {
+          "path": "/storages",
+          "value": []
+        }
+      ]
+    },
+    {
+      "name": "manifest-substitution",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/storages/0/confidential_storage/manifest_uri",
+          "value": "kbs:///default/codewire-storage-manifests/sha256-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      ]
+    },
+    {
+      "name": "access-downgrade",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/storages/0/confidential_storage/requested_access",
+          "value": 1
+        }
+      ]
+    },
+    {
+      "name": "plaintext-storage-downgrade",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/storages/0/fstype",
+          "value": "ext4"
+        }
+      ]
+    },
+    {
+      "name": "unsupported-storage-driver",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/storages/0/driver",
+          "value": "local"
+        }
+      ]
+    },
+    {
+      "name": "untrusted-device-source",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/storages/0/source",
+          "value": "/dev/vda"
+        }
+      ]
+    },
+    {
+      "name": "mount-storage-correlation-substitution",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/OCI/Mounts/0/source",
+          "value": "/run/kata-containers/shared/containers/passthrough/confidential-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        {
+          "path": "/OCI/Mounts/1/source",
+          "value": "/run/kata-containers/shared/containers/passthrough/confidential-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      ]
+    },
+    {
+      "name": "image-substitution",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/OCI/Annotations/io.kubernetes.cri.image-name",
+          "value": "ghcr.io/codewiresh/workspace:substituted"
+        }
+      ]
+    },
+    {
+      "name": "missing-storage",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/storages",
+          "value": []
+        }
+      ]
+    },
+    {
+      "name": "missing-storage-and-mounts",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/storages",
+          "value": []
+        },
+        {
+          "path": "/OCI/Mounts",
+          "value": []
+        }
+      ]
+    },
+    {
+      "name": "mount-option-substitution",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/OCI/Mounts/0/options",
+          "value": [
+            "rbind",
+            "rw"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "fs-group-substitution",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/storages/0/fs_group/group_id",
+          "value": 0
+        }
+      ]
+    },
+    {
+      "name": "invalid-fs-group",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/storages/0/fs_group/group_id",
+          "value": -1
+        }
+      ]
+    },
+    {
+      "name": "mount-point-substitution",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/storages/0/mount_point",
+          "value": "/run/kata-containers/shared/containers/passthrough/confidential-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        {
+          "path": "/OCI/Mounts/0/source",
+          "value": "/run/kata-containers/shared/containers/passthrough/confidential-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        },
+        {
+          "path": "/OCI/Mounts/1/source",
+          "value": "/run/kata-containers/shared/containers/passthrough/confidential-ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"
+        }
+      ]
+    },
+    {
+      "name": "extra-confidential-storage",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "copy_from": "/storages/0",
+          "path": "/storages/-"
+        }
+      ]
+    },
+    {
+      "name": "unexpected-protected-mount",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "copy_from": "/OCI/Mounts/1",
+          "path": "/OCI/Mounts/-"
+        },
+        {
+          "path": "/OCI/Mounts/2/destination",
+          "value": "/root"
+        }
+      ]
+    },
+    {
+      "name": "raw-agent-device-reintroduced",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/devices",
+          "value": [
+            {
+              "container_path": "/dev/codewire-workspace"
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "raw-oci-device-reintroduced",
+      "base": "workload",
+      "allowed": false,
+      "patches": [
+        {
+          "path": "/OCI/Linux/Devices",
+          "value": [
+            {
+              "Path": "/dev/codewire-workspace"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "invalid_declarations": [
+    {
+      "name": "missing-manifest-uri",
+      "value": {
+        "workspace": {
+          "devicePath": "/dev/codewire-workspace",
+          "access": "readWrite",
+          "fsGroup": 1000,
+          "fsGroupChangePolicy": "OnRootMismatch",
+          "mounts": {
+            "workspace": [
+              "/home/codewire",
+              "/workspace"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "read-only-is-not-rw-single",
+      "value": {
+        "workspace": {
+          "devicePath": "/dev/codewire-workspace",
+          "manifestUri": "kbs:///default/codewire-storage-manifests/sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "access": "readOnly",
+          "fsGroup": 1000,
+          "fsGroupChangePolicy": "OnRootMismatch",
+          "mounts": {
+            "workspace": [
+              "/home/codewire",
+              "/workspace"
+            ]
+          }
+        }
+      }
+    },
+    {
+      "name": "unknown-profile-field",
+      "value": {
+        "workspace": {
+          "devicePath": "/dev/codewire-workspace",
+          "manifestUri": "kbs:///default/codewire-storage-manifests/sha256-0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+          "access": "readWrite",
+          "fsGroup": 1000,
+          "fsGroupChangePolicy": "OnRootMismatch",
+          "mounts": {
+            "workspace": [
+              "/home/codewire",
+              "/workspace"
+            ]
+          },
+          "profile": "luks2"
+        }
+      }
+    }
+  ]
+}
