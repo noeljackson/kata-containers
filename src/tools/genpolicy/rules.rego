@@ -1360,6 +1360,17 @@ allow_confidential_volumes(p_volumes, i_mounts, i_storages) if {
         )
     }
     count(matched_mount_indices) == count(p_volumes)
+
+    # Do not allow the activated filesystem to be bound anywhere outside the
+    # measured destination set, even when the extra destination is otherwise
+    # an ordinary OCI mount.
+    confidential_mount_indices := {mount_index |
+        some mount_index
+        some storage_index
+        is_confidential_storage(i_storages[storage_index])
+        i_mounts[mount_index].source == i_storages[storage_index].mount_point
+    }
+    matched_mount_indices == confidential_mount_indices
 }
 
 confidential_volume_matches(policy, storage, mount) if {

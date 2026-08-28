@@ -201,55 +201,29 @@ mod tests {
 policy_data := {}
 default ConfidentialStorageTest := false
 ConfidentialStorageTest if {
-    allow_storages([], input.storages, "", "")
-    allow_confidential_volumes(input.policy, input.mounts, input.storages)
+    annotations := input.request.OCI.Annotations
+    annotations["io.katacontainers.pkg.oci.container_type"] == "pod_sandbox"
+    annotations["io.kubernetes.cri.container-type"] == "sandbox"
+    is_null(object.get(annotations, "io.kubernetes.cri.container-name", null))
+    confidential := [storage | some storage in input.request.storages; is_confidential_storage(storage)]
+    count(confidential) == 0
+    protected := [mount | some mount in input.request.OCI.Mounts; mount.destination in {"/home/codewire", "/workspace"}]
+    count(protected) == 0
+}
+ConfidentialStorageTest if {
+    annotations := input.request.OCI.Annotations
+    annotations["io.kubernetes.cri.container-name"] == input.container_name
+    annotations["io.kubernetes.cri.image-name"] == input.image
+    allow_storages([], input.request.storages, "", "")
+    allow_confidential_volumes(input.policy, input.request.OCI.Mounts, input.request.storages)
+    count(input.request.OCI.Mounts) == count(input.policy)
+    raw_agent_devices := [device | some device in input.request.devices; device.container_path == input.device_path]
+    count(raw_agent_devices) == 0
+    raw_oci_devices := [device | some device in input.request.OCI.Linux.Devices; device.Path == input.device_path]
+    count(raw_oci_devices) == 0
 }
 "#,
         );
-
-        let manifest_uri = "kbs:///tenant/storage-manifests/workspace-v1";
-        let mount_name = kata_types::mount::confidential_storage_mount_name(manifest_uri).unwrap();
-        let mount_point =
-            format!("/run/kata-containers/shared/containers/passthrough/{mount_name}");
-        let policy = serde_json::json!({
-            "volume_name": "workspace",
-            "manifest_uri": manifest_uri,
-            "requested_access": 2,
-            "mount_destination": "/workspace",
-            "mount_source": format!("^{mount_point}$"),
-            "mount_type": "bind",
-            "mount_options": ["rbind", "rprivate", "rw"],
-            "storage_fstype": "confidential-storage",
-            "filesystem_type": "ext4",
-            "filesystem_options": ["nodev", "nosuid", "rw"],
-            "fs_group": {
-                "group_id": 3000,
-                "group_change_policy": 1
-            }
-        });
-        let mount = serde_json::json!({
-            "destination": "/workspace",
-            "source": mount_point,
-            "type_": "bind",
-            "options": ["rbind", "rprivate", "rw"]
-        });
-        let storage = serde_json::json!({
-            "driver": "blk",
-            "driver_options": [],
-            "fs_group": {
-                "group_id": 3000,
-                "group_change_policy": 1
-            },
-            "fstype": "confidential-storage",
-            "mount_point": mount_point,
-            "options": [],
-            "source": "00/00",
-            "shared": false,
-            "confidential_storage": {
-                "manifest_uri": manifest_uri,
-                "requested_access": 2
-            }
-        });
 
         async fn allowed(rules: &str, input: &serde_json::Value) -> bool {
             let mut policy = AgentPolicy::new();
@@ -261,101 +235,63 @@ ConfidentialStorageTest if {
                 .0
         }
 
-        let valid = serde_json::json!({
-            "policy": [policy],
-            "mounts": [mount],
-            "storages": [storage]
-        });
-        assert!(allowed(&rules, &valid).await);
+        let fixture: serde_json::Value = serde_json::from_str(include_str!(
+            "testdata/confidential-storage-contract-v1.json"
+        ))
+        .expect("shared confidential-storage contract fixture must parse");
+        let container_name = fixture["workload_request"]["OCI"]["Annotations"]
+            ["io.kubernetes.cri.container-name"]
+            .clone();
+        let image = fixture["workload_request"]["OCI"]["Annotations"]
+            ["io.kubernetes.cri.image-name"]
+            .clone();
+        let device_path = fixture["declaration"]["workspace"]["devicePath"].clone();
 
-        let mut second_policy = valid["policy"][0].clone();
-        second_policy["mount_destination"] = serde_json::json!("/home/codewire");
-        let mut second_mount = valid["mounts"][0].clone();
-        second_mount["destination"] = serde_json::json!("/home/codewire");
-        let multiple_mounts = serde_json::json!({
-            "policy": [valid["policy"][0].clone(), second_policy],
-            "mounts": [valid["mounts"][0].clone(), second_mount],
-            "storages": [valid["storages"][0].clone()]
-        });
-        assert!(
-            allowed(&rules, &multiple_mounts).await,
-            "one confidential Storage may back several exactly authorized mounts"
-        );
-
-        let mut explicit_root_group = valid.clone();
-        explicit_root_group["policy"][0]["fs_group"]["group_id"] = serde_json::json!(0);
-        explicit_root_group["storages"][0]["fs_group"]["group_id"] = serde_json::json!(0);
-        assert!(allowed(&rules, &explicit_root_group).await);
-
-        let mut invalid_cases = Vec::new();
-
-        let mut manifest_substitution = valid.clone();
-        manifest_substitution["storages"][0]["confidential_storage"]["manifest_uri"] =
-            serde_json::json!("kbs:///tenant/storage-manifests/other-v1");
-        invalid_cases.push(("manifest substitution", manifest_substitution));
-
-        let mut access_downgrade = valid.clone();
-        access_downgrade["storages"][0]["confidential_storage"]["requested_access"] =
-            serde_json::json!(1);
-        invalid_cases.push(("access downgrade", access_downgrade));
-
-        let mut target_substitution = valid.clone();
-        target_substitution["mounts"][0]["destination"] = serde_json::json!("/other");
-        invalid_cases.push(("target substitution", target_substitution));
-
-        let mut plaintext_downgrade = valid.clone();
-        plaintext_downgrade["storages"][0]["fstype"] = serde_json::json!("ext4");
-        invalid_cases.push(("plaintext downgrade", plaintext_downgrade));
-
-        let mut wrong_driver = valid.clone();
-        wrong_driver["storages"][0]["driver"] = serde_json::json!("local");
-        invalid_cases.push(("wrong storage driver", wrong_driver));
-
-        let mut wrong_device_source = valid.clone();
-        wrong_device_source["storages"][0]["source"] = serde_json::json!("/dev/vda");
-        invalid_cases.push(("wrong device source", wrong_device_source));
-
-        let mut mount_correlation_substitution = valid.clone();
-        mount_correlation_substitution["mounts"][0]["source"] = serde_json::json!(
-            "/run/kata-containers/shared/containers/passthrough/confidential-0000000000000000000000000000000000000000000000000000000000000000"
-        );
-        invalid_cases.push((
-            "mount and storage correlation substitution",
-            mount_correlation_substitution,
-        ));
-
-        let mut fs_group_substitution = valid.clone();
-        fs_group_substitution["storages"][0]["fs_group"]["group_id"] = serde_json::json!(3001);
-        invalid_cases.push(("fsGroup substitution", fs_group_substitution));
-
-        let mut invalid_fs_group = valid.clone();
-        invalid_fs_group["storages"][0]["fs_group"]["group_id"] = serde_json::json!(-1);
-        invalid_cases.push(("invalid fsGroup", invalid_fs_group));
-
-        let mut filesystem_contract_substitution = valid.clone();
-        filesystem_contract_substitution["policy"][0]["filesystem_options"] =
-            serde_json::json!(["rw"]);
-        invalid_cases.push((
-            "filesystem contract substitution",
-            filesystem_contract_substitution,
-        ));
-
-        let mut extra_storage = valid.clone();
-        extra_storage["storages"]
-            .as_array_mut()
-            .unwrap()
-            .push(valid["storages"][0].clone());
-        invalid_cases.push(("extra confidential storage", extra_storage));
-
-        let mut missing_authorization = valid.clone();
-        missing_authorization["policy"] = serde_json::json!([]);
-        invalid_cases.push(("missing policy authorization", missing_authorization));
-
-        for (description, invalid) in invalid_cases {
-            assert!(
-                !allowed(&rules, &invalid).await,
-                "unexpectedly allowed {description}"
+        for case in fixture["cases"].as_array().unwrap() {
+            let mut request = match case["base"].as_str().unwrap() {
+                "workload" => fixture["workload_request"].clone(),
+                "sandbox" => fixture["sandbox_request"].clone(),
+                base => panic!("unknown conformance base {base:?}"),
+            };
+            apply_conformance_patches(&mut request, &case["patches"]);
+            let input = serde_json::json!({
+                "policy": fixture["expected_genpolicy"],
+                "request": request,
+                "container_name": container_name,
+                "image": image,
+                "device_path": device_path,
+            });
+            assert_eq!(
+                allowed(&rules, &input).await,
+                case["allowed"].as_bool().unwrap(),
+                "shared confidential-storage policy case {:?}",
+                case["name"].as_str().unwrap()
             );
+        }
+    }
+
+    fn apply_conformance_patches(request: &mut serde_json::Value, patches: &serde_json::Value) {
+        for patch in patches.as_array().expect("patches must be an array") {
+            let path = patch["path"].as_str().expect("patch path must be a string");
+            if let Some(copy_from) = patch.get("copy_from").and_then(serde_json::Value::as_str) {
+                let value = request
+                    .pointer(copy_from)
+                    .unwrap_or_else(|| panic!("copy source {copy_from:?} must exist"))
+                    .clone();
+                let parent_path = path
+                    .strip_suffix("/-")
+                    .unwrap_or_else(|| panic!("copy destination {path:?} must append to an array"));
+                request
+                    .pointer_mut(parent_path)
+                    .and_then(serde_json::Value::as_array_mut)
+                    .unwrap_or_else(|| panic!("copy destination parent {parent_path:?} must exist"))
+                    .push(value);
+            } else {
+                *request
+                    .pointer_mut(path)
+                    .unwrap_or_else(|| panic!("replacement path {path:?} must exist")) =
+                    patch["value"].clone();
+            }
         }
     }
 
