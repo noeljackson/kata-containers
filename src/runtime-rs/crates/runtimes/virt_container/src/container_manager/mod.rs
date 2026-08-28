@@ -6,6 +6,7 @@
 
 mod container;
 use container::{Container, Exec};
+mod confidential_volume;
 mod container_inner;
 mod io;
 use container_inner::ContainerInner;
