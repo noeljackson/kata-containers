@@ -41,6 +41,9 @@ pub(crate) mod utils;
 /// hypervisor capabilities
 pub mod capabilities;
 
+/// Backend-neutral confidential raw-block volume declarations.
+pub mod confidential_volume;
+
 /// Filesystem-related constants
 pub mod fs;
 

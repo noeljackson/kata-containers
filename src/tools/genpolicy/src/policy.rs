@@ -18,10 +18,10 @@ use crate::yaml;
 
 use anyhow::{anyhow, Result};
 use kata_types::annotations::KATA_ANNO_CONFIDENTIAL_VOLUME;
-use kata_types::mount::{
-    confidential_storage_mount_name, validate_confidential_manifest_uri,
-    KATA_CONFIDENTIAL_STORAGE_FS_TYPE,
+use kata_types::confidential_volume::{
+    parse_confidential_volume_declarations, ConfidentialFSGroupChangePolicy,
 };
+use kata_types::mount::{confidential_storage_mount_name, KATA_CONFIDENTIAL_STORAGE_FS_TYPE};
 use log::debug;
 use oci_spec::runtime as oci;
 use protocols::agent;
@@ -32,7 +32,6 @@ use std::boxed;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::read_to_string;
 use std::io::Write;
-use std::path::Path;
 use std::process::exit;
 
 /// Intermediary format of policy data.
@@ -317,65 +316,15 @@ pub struct ConfidentialVolumePolicy {
     fs_group: Option<ConfidentialFSGroupPolicy>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 struct ConfidentialFSGroupPolicy {
     group_id: u32,
     group_change_policy: i32,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase")]
-enum ConfidentialVolumeAccess {
-    ReadOnly,
-    ReadWrite,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-struct ConfidentialVolumeDeclaration {
-    manifest_uri: String,
-    access: ConfidentialVolumeAccess,
-}
-
-struct ConfidentialVolumeDeclarations(BTreeMap<String, ConfidentialVolumeDeclaration>);
-
-impl<'de> Deserialize<'de> for ConfidentialVolumeDeclarations {
-    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
-    where
-        D: serde::Deserializer<'de>,
-    {
-        struct DeclarationsVisitor;
-
-        impl<'de> serde::de::Visitor<'de> for DeclarationsVisitor {
-            type Value = ConfidentialVolumeDeclarations;
-
-            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-                formatter.write_str("a map of unique confidential volume declarations")
-            }
-
-            fn visit_map<A>(self, mut map: A) -> std::result::Result<Self::Value, A::Error>
-            where
-                A: serde::de::MapAccess<'de>,
-            {
-                let mut declarations = BTreeMap::new();
-                while let Some((name, declaration)) = map.next_entry()? {
-                    if declarations.insert(name, declaration).is_some() {
-                        return Err(serde::de::Error::custom(
-                            "duplicate confidential volume declaration",
-                        ));
-                    }
-                }
-                Ok(ConfidentialVolumeDeclarations(declarations))
-            }
-        }
-
-        deserializer.deserialize_map(DeclarationsVisitor)
-    }
-}
-
 fn confidential_volume_declarations(
     resource: &dyn yaml::K8sResource,
-) -> Result<BTreeMap<String, ConfidentialVolumeDeclaration>> {
+) -> Result<BTreeMap<String, kata_types::confidential_volume::ConfidentialVolumeDeclaration>> {
     let Some(raw) = resource
         .get_annotations()
         .as_ref()
@@ -384,39 +333,35 @@ fn confidential_volume_declarations(
         return Ok(BTreeMap::new());
     };
 
-    let ConfidentialVolumeDeclarations(declarations) = serde_json::from_str(raw)
+    let declarations = parse_confidential_volume_declarations(raw)
         .map_err(|error| anyhow!("invalid {KATA_ANNO_CONFIDENTIAL_VOLUME} annotation: {error}"))?;
-    if declarations.is_empty() {
-        return Err(anyhow!(
-            "{KATA_ANNO_CONFIDENTIAL_VOLUME} must declare at least one volume"
-        ));
-    }
 
     let pod_spec = resource.get_pod_spec().ok_or_else(|| {
         anyhow!("{KATA_ANNO_CONFIDENTIAL_VOLUME} is unsupported for this resource type")
     })?;
-    let mut manifest_uris = BTreeSet::new();
+    let pod_fs_group = confidential_fs_group(pod_spec)?;
     for (volume_name, declaration) in &declarations {
-        if volume_name.is_empty() || volume_name.len() > 253 {
-            return Err(anyhow!(
-                "confidential volume name {volume_name:?} is invalid"
-            ));
-        }
-        validate_confidential_manifest_uri(&declaration.manifest_uri)?;
-        if declaration.access != ConfidentialVolumeAccess::ReadWrite {
-            return Err(anyhow!(
-                "confidential volume {volume_name:?} requests unsupported readOnly access"
-            ));
-        }
-        if !manifest_uris.insert(declaration.manifest_uri.as_str()) {
-            return Err(anyhow!(
-                "confidential manifest URI {:?} is assigned to more than one volume",
-                declaration.manifest_uri
-            ));
-        }
         if !resource.has_persistent_volume_claim(volume_name) {
             return Err(anyhow!(
                 "confidential volume {volume_name:?} must name exactly one persistentVolumeClaim"
+            ));
+        }
+        let declared_fs_group = declaration
+            .fs_group
+            .map(|group_id| ConfidentialFSGroupPolicy {
+                group_id,
+                group_change_policy: match declaration.fs_group_change_policy {
+                    Some(ConfidentialFSGroupChangePolicy::OnRootMismatch) => {
+                        FSGroupChangePolicy::OnRootMismatch as i32
+                    }
+                    None | Some(ConfidentialFSGroupChangePolicy::Always) => {
+                        FSGroupChangePolicy::Always as i32
+                    }
+                },
+            });
+        if declared_fs_group != pod_fs_group {
+            return Err(anyhow!(
+                "confidential volume {volume_name:?} fsGroup contract does not match Pod securityContext"
             ));
         }
 
@@ -427,35 +372,96 @@ fn confidential_volume_declarations(
             .flatten()
             .filter(|mount| mount.name == *volume_name)
             .collect::<Vec<_>>();
-        if volume_mounts.is_empty() {
+        if !volume_mounts.is_empty() {
             return Err(anyhow!(
-                "confidential volume {volume_name:?} is not mounted by any container"
+                "confidential volume {volume_name:?} must use volumeDevices, not volumeMounts"
             ));
         }
-        for mount in volume_mounts {
-            validate_confidential_volume_mount(volume_name, mount)?;
+
+        let mut declared_containers = declaration
+            .mounts
+            .0
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>();
+        let mut uses = 0;
+        for container in &pod_spec.containers {
+            if container
+                .volumeDevices
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .any(|device| {
+                    device.devicePath == declaration.device_path && device.name != *volume_name
+                })
+            {
+                return Err(anyhow!(
+                    "confidential device path {:?} is reused by another volume in container {:?}",
+                    declaration.device_path,
+                    container.name
+                ));
+            }
+            let matching_devices = container
+                .volumeDevices
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .filter(|device| device.name == *volume_name)
+                .collect::<Vec<_>>();
+            if declaration.mounts.0.contains_key(&container.name) {
+                declared_containers.remove(container.name.as_str());
+                if matching_devices.len() != 1
+                    || matching_devices[0].devicePath != declaration.device_path
+                {
+                    return Err(anyhow!(
+                        "confidential volume {volume_name:?} container {:?} must use exactly one matching volumeDevice at {:?}",
+                        container.name,
+                        declaration.device_path
+                    ));
+                }
+                uses += 1;
+            } else if !matching_devices.is_empty() {
+                return Err(anyhow!(
+                    "confidential volume {volume_name:?} is used by undeclared container {:?}",
+                    container.name
+                ));
+            }
+        }
+        if !declared_containers.is_empty() {
+            return Err(anyhow!(
+                "confidential volume {volume_name:?} names containers absent from the Pod: {declared_containers:?}"
+            ));
+        }
+        if uses == 0 {
+            return Err(anyhow!(
+                "confidential volume {volume_name:?} is not used by any container"
+            ));
+        }
+        for container in pod_spec.initContainers.as_ref().into_iter().flatten() {
+            let uses_confidential_volume = container
+                .volumeDevices
+                .as_ref()
+                .into_iter()
+                .flatten()
+                .any(|device| {
+                    device.name == *volume_name || device.devicePath == declaration.device_path
+                })
+                || container
+                    .volumeMounts
+                    .as_ref()
+                    .into_iter()
+                    .flatten()
+                    .any(|mount| mount.name == *volume_name);
+            if uses_confidential_volume {
+                return Err(anyhow!(
+                    "confidential volume {volume_name:?} is not supported in init container {:?}",
+                    container.name
+                ));
+            }
         }
     }
 
     Ok(declarations)
-}
-
-fn validate_confidential_volume_mount(volume_name: &str, mount: &pod::VolumeMount) -> Result<()> {
-    let destination = Path::new(&mount.mountPath);
-    if !destination.is_absolute()
-        || destination
-            .components()
-            .any(|component| matches!(component, std::path::Component::ParentDir))
-        || mount.readOnly == Some(true)
-        || mount.mountPropagation.is_some()
-        || mount.subPath.is_some()
-        || mount.subPathExpr.is_some()
-    {
-        return Err(anyhow!(
-            "confidential volume {volume_name:?} has an unsupported mount contract"
-        ));
-    }
-    Ok(())
 }
 
 fn confidential_fs_group(pod_spec: &pod::PodSpec) -> Result<Option<ConfidentialFSGroupPolicy>> {
@@ -492,71 +498,68 @@ fn confidential_fs_group(pod_spec: &pod::PodSpec) -> Result<Option<ConfidentialF
 fn confidential_volume_policies(
     resource: &dyn yaml::K8sResource,
     container: &pod::Container,
-    policy_mounts: &mut [KataMount],
-) -> Result<Vec<ConfidentialVolumePolicy>> {
+    policy_mounts: &mut Vec<KataMount>,
+) -> Result<(Vec<ConfidentialVolumePolicy>, BTreeSet<String>)> {
     let declarations = confidential_volume_declarations(resource)?;
     if declarations.is_empty() {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), BTreeSet::new()));
     }
     let pod_spec = resource
         .get_pod_spec()
         .ok_or_else(|| anyhow!("confidential volume resource has no PodSpec"))?;
     let fs_group = confidential_fs_group(pod_spec)?;
     let mut policies = Vec::new();
+    let mut consumed_device_paths = BTreeSet::new();
 
-    for volume_mount in container.volumeMounts.as_ref().into_iter().flatten() {
-        let Some(declaration) = declarations.get(&volume_mount.name) else {
+    for (volume_name, declaration) in declarations {
+        let Some(destinations) = declaration.mounts.0.get(&container.name) else {
             continue;
         };
-        validate_confidential_volume_mount(&volume_mount.name, volume_mount)?;
         let mount_name = confidential_storage_mount_name(&declaration.manifest_uri)?;
         let mount_source =
             format!("^/run/kata-containers/shared/containers/passthrough/{mount_name}$");
-        let matching_mounts = policy_mounts
-            .iter()
-            .enumerate()
-            .filter(|(_, mount)| mount.destination == volume_mount.mountPath)
-            .map(|(index, _)| index)
-            .collect::<Vec<_>>();
-        if matching_mounts.len() != 1 {
-            return Err(anyhow!(
-                "confidential volume {:?} must produce exactly one OCI mount at {:?}",
-                volume_mount.name,
-                volume_mount.mountPath
-            ));
-        }
-        let mount = &mut policy_mounts[matching_mounts[0]];
-        if mount.type_ != "bind"
-            || mount.options
-                != [
-                    "rbind".to_string(),
-                    "rprivate".to_string(),
+        for destination in destinations {
+            if policy_mounts
+                .iter()
+                .any(|mount| mount.destination == *destination)
+            {
+                return Err(anyhow!(
+                    "confidential volume {volume_name:?} collides with OCI mount destination {destination:?}"
+                ));
+            }
+            let mount_options = vec![
+                "rbind".to_string(),
+                "rprivate".to_string(),
+                "rw".to_string(),
+            ];
+            policy_mounts.push(KataMount {
+                destination: destination.clone(),
+                source: mount_source.clone(),
+                type_: "bind".to_string(),
+                options: mount_options.clone(),
+            });
+            policies.push(ConfidentialVolumePolicy {
+                volume_name: volume_name.clone(),
+                manifest_uri: declaration.manifest_uri.clone(),
+                requested_access: agent::ConfidentialStorageAccess::ReadWrite as i32,
+                mount_destination: destination.clone(),
+                mount_source: mount_source.clone(),
+                mount_type: "bind".to_string(),
+                mount_options,
+                storage_fstype: KATA_CONFIDENTIAL_STORAGE_FS_TYPE.to_string(),
+                filesystem_type: "ext4".to_string(),
+                filesystem_options: vec![
+                    "nodev".to_string(),
+                    "nosuid".to_string(),
                     "rw".to_string(),
-                ]
-        {
-            return Err(anyhow!(
-                "confidential volume {:?} produced an unexpected OCI mount contract",
-                volume_mount.name
-            ));
+                ],
+                fs_group: fs_group.clone(),
+            });
         }
-        mount.source.clone_from(&mount_source);
-
-        policies.push(ConfidentialVolumePolicy {
-            volume_name: volume_mount.name.clone(),
-            manifest_uri: declaration.manifest_uri.clone(),
-            requested_access: agent::ConfidentialStorageAccess::ReadWrite as i32,
-            mount_destination: volume_mount.mountPath.clone(),
-            mount_source,
-            mount_type: mount.type_.clone(),
-            mount_options: mount.options.clone(),
-            storage_fstype: KATA_CONFIDENTIAL_STORAGE_FS_TYPE.to_string(),
-            filesystem_type: "ext4".to_string(),
-            filesystem_options: vec!["nodev".to_string(), "nosuid".to_string(), "rw".to_string()],
-            fs_group: fs_group.clone(),
-        });
+        consumed_device_paths.insert(declaration.device_path);
     }
 
-    Ok(policies)
+    Ok((policies, consumed_device_paths))
 }
 
 /// See Reference / Kubernetes API / Config and Storage Resources / Volume.
@@ -982,7 +985,7 @@ impl AgentPolicy {
             yaml_container,
             &self.config.settings,
         );
-        let confidential_volumes =
+        let (confidential_volumes, confidential_device_paths) =
             confidential_volume_policies(resource, yaml_container, &mut mounts).unwrap_or_else(
                 |error| panic!("failed to generate confidential volume policy: {error:#}"),
             );
@@ -1009,6 +1012,9 @@ impl AgentPolicy {
         let mut devices: Vec<agent::Device> = vec![];
         if let Some(volumeDevices) = &yaml_container.volumeDevices {
             for volumeDevice in volumeDevices {
+                if confidential_device_paths.contains(&volumeDevice.devicePath) {
+                    continue;
+                }
                 if volumeDevice
                     .devicePath
                     .starts_with(&self.config.settings.devices.vfio.device_path)
@@ -1666,7 +1672,7 @@ mod tests {
     fn confidential_pod(
         annotation: &str,
         volume_source: &str,
-        mount_contract: &str,
+        container_contract: &str,
     ) -> Box<dyn yaml::K8sResource + Sync + Send> {
         let document = format!(
             r#"apiVersion: v1
@@ -1682,10 +1688,10 @@ spec:
   containers:
   - name: workspace
     image: example.invalid/workspace:latest
-    volumeMounts:
+    volumeDevices:
     - name: workspace
-      mountPath: /workspace
-{mount_contract}
+      devicePath: /dev/confidential-workspace
+{container_contract}
   volumes:
   - name: workspace
 {volume_source}
@@ -1696,7 +1702,7 @@ spec:
 
     fn valid_confidential_pod() -> Box<dyn yaml::K8sResource + Sync + Send> {
         confidential_pod(
-            r#"{"workspace":{"manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite"}}"#,
+            r#"{"workspace":{"devicePath":"/dev/confidential-workspace","manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite","fsGroup":3000,"fsGroupChangePolicy":"OnRootMismatch","mounts":{"workspace":["/workspace"]}}}"#,
             "    persistentVolumeClaim:\n      claimName: workspace",
             "",
         )
@@ -1778,18 +1784,9 @@ spec:
     fn confidential_volume_policy_is_derived_from_exact_pod_contract() {
         let resource = valid_confidential_pod();
         let container = &resource.get_containers()[0];
-        let mut mounts = vec![KataMount {
-            destination: "/workspace".to_string(),
-            source: "untrusted-generated-source".to_string(),
-            type_: "bind".to_string(),
-            options: vec![
-                "rbind".to_string(),
-                "rprivate".to_string(),
-                "rw".to_string(),
-            ],
-        }];
+        let mut mounts = Vec::new();
 
-        let policies =
+        let (policies, consumed_device_paths) =
             confidential_volume_policies(resource.as_ref(), container, &mut mounts).unwrap();
         let value = serde_json::to_value(&policies).unwrap();
 
@@ -1813,31 +1810,23 @@ spec:
         assert_eq!(value[0]["fs_group"]["group_id"], 3000);
         assert_eq!(value[0]["fs_group"]["group_change_policy"], 1);
         assert_eq!(mounts[0].source, value[0]["mount_source"]);
+        assert_eq!(
+            consumed_device_paths,
+            BTreeSet::from(["/dev/confidential-workspace".to_string()])
+        );
     }
 
     #[test]
     fn confidential_volume_policy_preserves_every_mount_of_one_pvc() {
         let resource = confidential_pod(
-            r#"{"workspace":{"manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite"}}"#,
+            r#"{"workspace":{"devicePath":"/dev/confidential-workspace","manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite","fsGroup":3000,"fsGroupChangePolicy":"OnRootMismatch","mounts":{"workspace":["/workspace","/home/workspace"]}}}"#,
             "    persistentVolumeClaim:\n      claimName: workspace",
-            "    - name: workspace\n      mountPath: /home/codewire",
+            "",
         );
         let container = &resource.get_containers()[0];
-        let mut mounts = ["/workspace", "/home/codewire"]
-            .into_iter()
-            .map(|destination| KataMount {
-                destination: destination.to_string(),
-                source: "untrusted-generated-source".to_string(),
-                type_: "bind".to_string(),
-                options: vec![
-                    "rbind".to_string(),
-                    "rprivate".to_string(),
-                    "rw".to_string(),
-                ],
-            })
-            .collect::<Vec<_>>();
+        let mut mounts = Vec::new();
 
-        let policies =
+        let (policies, _) =
             confidential_volume_policies(resource.as_ref(), container, &mut mounts).unwrap();
         let destinations = policies
             .iter()
@@ -1847,7 +1836,7 @@ spec:
         assert_eq!(policies.len(), 2);
         assert_eq!(
             destinations,
-            BTreeSet::from(["/home/codewire", "/workspace"])
+            BTreeSet::from(["/home/workspace", "/workspace"])
         );
         assert_eq!(
             policies[0].manifest_uri, policies[1].manifest_uri,
@@ -1877,45 +1866,59 @@ spec:
     #[test]
     fn confidential_volume_declaration_rejects_unsupported_pod_contracts() {
         let read_only = confidential_pod(
-            r#"{"workspace":{"manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readOnly"}}"#,
+            r#"{"workspace":{"devicePath":"/dev/confidential-workspace","manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readOnly","fsGroup":3000,"fsGroupChangePolicy":"OnRootMismatch","mounts":{"workspace":["/workspace"]}}}"#,
             "    persistentVolumeClaim:\n      claimName: workspace",
             "",
         );
         assert!(confidential_volume_declarations(read_only.as_ref()).is_err());
 
         let unknown_field = confidential_pod(
-            r#"{"workspace":{"manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite","profile":"luks2"}}"#,
+            r#"{"workspace":{"devicePath":"/dev/confidential-workspace","manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite","fsGroup":3000,"fsGroupChangePolicy":"OnRootMismatch","mounts":{"workspace":["/workspace"]},"profile":"luks2"}}"#,
             "    persistentVolumeClaim:\n      claimName: workspace",
             "",
         );
         assert!(confidential_volume_declarations(unknown_field.as_ref()).is_err());
 
         let duplicate_volume = confidential_pod(
-            r#"{"workspace":{"manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite"},"workspace":{"manifestUri":"kbs:///tenant/storage-manifests/other-v1","access":"readWrite"}}"#,
+            r#"{"workspace":{"devicePath":"/dev/confidential-workspace","manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite","fsGroup":3000,"fsGroupChangePolicy":"OnRootMismatch","mounts":{"workspace":["/workspace"]}},"workspace":{"devicePath":"/dev/other","manifestUri":"kbs:///tenant/storage-manifests/other-v1","access":"readWrite","fsGroup":3000,"fsGroupChangePolicy":"OnRootMismatch","mounts":{"workspace":["/other"]}}}"#,
             "    persistentVolumeClaim:\n      claimName: workspace",
             "",
         );
         assert!(confidential_volume_declarations(duplicate_volume.as_ref()).is_err());
 
         let mutable_uri = confidential_pod(
-            r#"{"workspace":{"manifestUri":"kbs:///tenant/storage-manifests/latest?revision=1","access":"readWrite"}}"#,
+            r#"{"workspace":{"devicePath":"/dev/confidential-workspace","manifestUri":"kbs:///tenant/storage-manifests/latest?revision=1","access":"readWrite","fsGroup":3000,"fsGroupChangePolicy":"OnRootMismatch","mounts":{"workspace":["/workspace"]}}}"#,
             "    persistentVolumeClaim:\n      claimName: workspace",
             "",
         );
         assert!(confidential_volume_declarations(mutable_uri.as_ref()).is_err());
 
         let non_pvc = confidential_pod(
-            r#"{"workspace":{"manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite"}}"#,
+            r#"{"workspace":{"devicePath":"/dev/confidential-workspace","manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite","fsGroup":3000,"fsGroupChangePolicy":"OnRootMismatch","mounts":{"workspace":["/workspace"]}}}"#,
             "    emptyDir: {}",
             "",
         );
         assert!(confidential_volume_declarations(non_pvc.as_ref()).is_err());
 
         let unsupported_mount = confidential_pod(
-            r#"{"workspace":{"manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite"}}"#,
+            r#"{"workspace":{"devicePath":"/dev/confidential-workspace","manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite","fsGroup":3000,"fsGroupChangePolicy":"OnRootMismatch","mounts":{"workspace":["/workspace"]}}}"#,
             "    persistentVolumeClaim:\n      claimName: workspace",
-            "      subPath: nested",
+            "    volumeMounts:\n    - name: workspace\n      mountPath: /workspace",
         );
         assert!(confidential_volume_declarations(unsupported_mount.as_ref()).is_err());
+
+        let wrong_device_path = confidential_pod(
+            r#"{"workspace":{"devicePath":"/dev/other","manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite","fsGroup":3000,"fsGroupChangePolicy":"OnRootMismatch","mounts":{"workspace":["/workspace"]}}}"#,
+            "    persistentVolumeClaim:\n      claimName: workspace",
+            "",
+        );
+        assert!(confidential_volume_declarations(wrong_device_path.as_ref()).is_err());
+
+        let wrong_fs_group = confidential_pod(
+            r#"{"workspace":{"devicePath":"/dev/confidential-workspace","manifestUri":"kbs:///tenant/storage-manifests/workspace-v1","access":"readWrite","fsGroup":3001,"fsGroupChangePolicy":"OnRootMismatch","mounts":{"workspace":["/workspace"]}}}"#,
+            "    persistentVolumeClaim:\n      claimName: workspace",
+            "",
+        );
+        assert!(confidential_volume_declarations(wrong_fs_group.as_ref()).is_err());
     }
 }
