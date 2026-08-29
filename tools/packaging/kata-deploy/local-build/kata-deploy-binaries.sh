@@ -428,14 +428,15 @@ get_coco_guest_components_container_image_digest() {
 # The extension disk is an OCI artifact. Upstream publishes a multi-arch index;
 # downstream builds may bind an architecture-specific immutable tag.
 get_coco_extension_disk_image_ref() {
-	local version image variant
+	local version image variant oci_arch
 	version="$(get_from_kata_deps ".externals.coco-guest-components.version")"
 	image="$(get_from_kata_deps ".externals.coco-guest-components.extension_image")"
 	variant="$(get_coco_extension_variant)"
+	oci_arch="$(get_coco_extension_oci_arch)"
 	[[ -n "${version}" ]] || die "Failed to get coco-guest-components version from versions.yaml"
 	[[ -n "${image}" ]] || die "Failed to get coco-guest-components extension_image from versions.yaml"
 
-	echo "${image}:${version}-${variant}"
+	echo "${image}:${version}-${variant}-${oci_arch}"
 }
 
 # GitHub "owner/repo" that owns the provenance attestation, derived from the
