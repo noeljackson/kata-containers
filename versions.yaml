@@ -205,15 +205,15 @@ assets:
   kernel:
     description: "Linux kernel optimised for virtual machines"
     url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-    version: "v6.18.35"
+    version: "v6.18.48"
     nvidia:
       url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-      version: "v6.18.35"
+      version: "v6.18.48"
 
   kernel-dragonball-experimental:
     description: "Linux kernel with Dragonball VMM optimizations like upcall"
     url: "https://cdn.kernel.org/pub/linux/kernel/v6.x/"
-    version: "v6.18.35"
+    version: "v6.18.48"
 
 externals:
   description: "Third-party projects used by the system"
@@ -347,7 +347,9 @@ externals:
   nydus-snapshotter:
     description: "Snapshotter for Nydus image acceleration service"
     url: "https://github.com/containerd/nydus-snapshotter"
-    version: "v0.15.15"
+    version: "v0.15.16-0.20260824095544-aab11e826dd7"
+    revision: "aab11e826dd7596c1c932905aef9cd307c05e26e"
+    archive-sha256: "39a2b0c231e80fbc22ce90f6c4786f1cf96331fcc365e8cddd5bd99b8c262e4f"
 
   opa:
     description: "Open Policy Agent"
