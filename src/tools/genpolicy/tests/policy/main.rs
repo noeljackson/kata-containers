@@ -198,7 +198,11 @@ mod tests {
         let mut rules = fs::read_to_string(rules_path).expect("rules.rego should open");
         rules.push_str(
             r#"
-policy_data := {}
+policy_data := {"common": {
+    "root_path": "/run/kata-containers/sandbox/rootfs",
+    "sfprefix": "/run/kata-containers/shared/sandboxes/",
+    "cpath": "/run/kata-containers/shared/containers/"
+}}
 default ConfidentialStorageTest := false
 ConfidentialStorageTest if {
     annotations := input.request.OCI.Annotations
@@ -268,6 +272,118 @@ ConfidentialStorageTest if {
                 case["name"].as_str().unwrap()
             );
         }
+    }
+
+    #[tokio::test]
+    async fn test_mount_source_advisory_regressions() {
+        let rules_path = path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rules.rego");
+        let mut rules = fs::read_to_string(rules_path).expect("rules.rego should open");
+        rules.push_str(
+            r#"
+policy_data := {"common": {
+    "root_path": "/run/kata-containers/sandbox/$(bundle-id)/rootfs",
+    "sfprefix": "/run/kata-containers/shared/sandboxes/",
+    "cpath": "/run/kata-containers/shared/containers/"
+}}
+default MountSourceAdvisoryTest := false
+MountSourceAdvisoryTest if {
+    _ := allow_mount(input.policy_oci, input.mount, input.storages, input.bundle_id, "sandbox")
+}
+default ImagePullMountPointAdvisoryTest := false
+ImagePullMountPointAdvisoryTest if {
+    allow_storage([], input.storage, input.bundle_id, "sandbox")
+}
+"#,
+        );
+
+        async fn allowed(rules: &str, endpoint: &str, input: serde_json::Value) -> bool {
+            let mut policy = AgentPolicy::new();
+            policy.set_policy(rules).await.unwrap();
+            policy
+                .allow_request(endpoint, &input.to_string())
+                .await
+                .unwrap()
+                .0
+        }
+
+        let empty_source_policy = serde_json::json!({
+            "Mounts": [{
+                "destination": "/data",
+                "source": "",
+                "type_": "bind",
+                "options": ["rbind", "rw"]
+            }]
+        });
+        let arbitrary_mount = serde_json::json!({
+            "destination": "/data",
+            "source": "/run/kata-containers/guest-secret",
+            "type_": "bind",
+            "options": ["rbind", "rw"]
+        });
+
+        for driver in ["image_guest_pull", "local"] {
+            let input = serde_json::json!({
+                "policy_oci": empty_source_policy,
+                "mount": arbitrary_mount,
+                "storages": [{
+                    "driver": driver,
+                    "mount_point": "/run/kata-containers/guest-secret"
+                }],
+                "bundle_id": "bundle"
+            });
+            assert!(
+                !allowed(&rules, "MountSourceAdvisoryTest", input).await,
+                "empty policy source accepted {driver} storage as an arbitrary mount source"
+            );
+        }
+
+        let block_input = serde_json::json!({
+            "policy_oci": empty_source_policy,
+            "mount": arbitrary_mount,
+            "storages": [{
+                "driver": "blk",
+                "mount_point": "/run/kata-containers/guest-secret"
+            }],
+            "bundle_id": "bundle"
+        });
+        assert!(
+            allowed(&rules, "MountSourceAdvisoryTest", block_input).await,
+            "legitimate block-backed empty-source mount was rejected"
+        );
+
+        let image_pull_storage = |mount_point: &str| {
+            serde_json::json!({
+                "storage": {
+                    "driver": "image_guest_pull",
+                    "driver_options": [],
+                    "fstype": "overlay",
+                    "fs_group": null,
+                    "mount_point": mount_point,
+                    "options": [],
+                    "shared": false,
+                    "source": "image"
+                },
+                "bundle_id": "bundle"
+            })
+        };
+        assert!(
+            !allowed(
+                &rules,
+                "ImagePullMountPointAdvisoryTest",
+                image_pull_storage("/run/kata-containers/guest-secret")
+            )
+            .await,
+            "image_guest_pull accepted an attacker-selected mount point"
+        );
+        assert!(
+            allowed(
+                &rules,
+                "ImagePullMountPointAdvisoryTest",
+                image_pull_storage("/run/kata-containers/sandbox/bundle/rootfs")
+            )
+            .await,
+            "canonical image_guest_pull rootfs path was rejected"
+        );
     }
 
     fn apply_conformance_patches(request: &mut serde_json::Value, patches: &serde_json::Value) {
