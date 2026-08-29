@@ -5,7 +5,10 @@
 //
 
 use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs;
+use std::os::fd::OwnedFd;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
@@ -13,7 +16,12 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use kata_sys_util::mount::{create_mount_destination, parse_mount_options};
 use kata_types::mount::{StorageDevice, StorageHandlerManager, KATA_SHAREDFS_GUEST_PREMOUNT_TAG};
-use nix::unistd::{Gid, Uid};
+use nix::dir::Dir;
+use nix::fcntl::AtFlags;
+use nix::sys::stat::{fchmod, fstat, FileStat, Mode, SFlag};
+use nix::unistd::{fchownat, Gid, Uid};
+use pathrs::flags::{OpenFlags, ResolverFlags};
+use pathrs::{Handle, Root};
 use protocols::agent::Storage;
 use protocols::types::FSGroupChangePolicy;
 use slog::Logger;
@@ -553,18 +561,15 @@ pub fn set_ownership(logger: &Logger, storage: &Storage) -> Result<()> {
     let fs_group = storage.fs_group();
     let read_only = storage.options.contains(&String::from("ro"));
     let mount_path = Path::new(&storage.mount_point);
-    let metadata = mount_path
-        .metadata()
-        .inspect_err(|err| {
-            error!(logger, "failed to obtain metadata for mount path";
-                "mount-path" => mount_path.to_str(),
-                "error" => err.to_string(),
-            )
-        })
-        .context("inspect volume mount point before fsGroup ownership")?;
+    let (root, root_stat) = open_ownership_root(mount_path).inspect_err(|err| {
+        error!(logger, "failed to securely open mount path";
+            "mount-path" => mount_path.to_str(),
+            "error" => err.to_string(),
+        )
+    })?;
 
     if fs_group.group_change_policy == FSGroupChangePolicy::OnRootMismatch.into()
-        && metadata.gid() == fs_group.group_id
+        && root_stat.st_gid == fs_group.group_id
     {
         let mut mask = if read_only { RO_MASK } else { RW_MASK };
         mask |= EXEC_MASK;
@@ -573,7 +578,7 @@ pub fn set_ownership(logger: &Logger, storage: &Storage) -> Result<()> {
         // gid of the mount path root directory matches the desired gid
         // and the current permission of mount path root directory is correct,
         // then ownership change will be skipped.
-        let current_mode = metadata.permissions().mode();
+        let current_mode = root_stat.st_mode;
         if (mask & current_mode == mask) && (current_mode & MODE_SETGID != 0) {
             info!(logger, "skipping ownership change for volume";
                 "mount-path" => mount_path.to_str(),
@@ -587,8 +592,10 @@ pub fn set_ownership(logger: &Logger, storage: &Storage) -> Result<()> {
         "mount-path" => mount_path.to_str(),
         "fs-group" => fs_group.group_id.to_string(),
     );
-    recursive_ownership_change(
-        mount_path,
+    recursive_ownership_change_from_root(
+        &root,
+        Path::new("."),
+        root_stat.st_dev,
         None,
         Some(Gid::from_raw(fs_group.group_id)),
         read_only,
@@ -602,40 +609,177 @@ pub fn recursive_ownership_change(
     gid: Option<Gid>,
     read_only: bool,
 ) -> Result<()> {
-    let mut mask = if read_only { RO_MASK } else { RW_MASK };
-    if path.is_dir() {
-        for entry in
-            fs::read_dir(path).context("read directory during recursive fsGroup ownership")?
-        {
-            let entry = entry.context("read child entry during recursive fsGroup ownership")?;
-            recursive_ownership_change(entry.path().as_path(), uid, gid, read_only)?;
+    let (root, root_stat) =
+        open_ownership_root(path).context("change ownership during recursive fsGroup ownership")?;
+    recursive_ownership_change_from_root(
+        &root,
+        Path::new("."),
+        root_stat.st_dev,
+        uid,
+        gid,
+        read_only,
+    )
+    .context("change ownership during recursive fsGroup ownership")
+}
+
+fn open_ownership_root(path: &Path) -> Result<(Root, FileStat)> {
+    let relative = path
+        .strip_prefix("/")
+        .context("fsGroup mount path must be absolute")?;
+    let relative = if relative.as_os_str().is_empty() {
+        Path::new(".")
+    } else {
+        relative
+    };
+    let system_root = Root::open("/")?.with_resolver_flags(ResolverFlags::NO_SYMLINKS);
+    let handle = system_root
+        .resolve(relative)
+        .context("resolve fsGroup mount path without symlinks")?;
+    let stat = fstat(&handle).context("inspect fsGroup mount root handle")?;
+    if !SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) {
+        return Err(anyhow!("fsGroup mount path is not a directory"));
+    }
+
+    let mut root = Root::from_fd(OwnedFd::from(handle));
+    root.set_resolver_flags(ResolverFlags::NO_SYMLINKS);
+    Ok((root, stat))
+}
+
+fn resolve_ownership_entry(
+    root: &Root,
+    relative: &Path,
+    root_device: libc::dev_t,
+) -> Result<Option<(Handle, FileStat)>> {
+    // Inspect the leaf without following it so symlinks are skipped. Resolve a
+    // second time with NO_SYMLINKS before use so an intermediate or raced leaf
+    // symlink cannot become an authority-bearing handle.
+    let inspection = root
+        .as_ref()
+        .with_resolver_flags(ResolverFlags::empty())
+        .resolve_nofollow(relative)
+        .with_context(|| format!("inspect fsGroup entry {relative:?} without following leaf"))?;
+    let inspection_stat = fstat(&inspection)
+        .with_context(|| format!("inspect fsGroup entry metadata for {relative:?}"))?;
+    if SFlag::from_bits_truncate(inspection_stat.st_mode).contains(SFlag::S_IFLNK) {
+        return Ok(None);
+    }
+
+    let handle = root
+        .resolve(relative)
+        .with_context(|| format!("resolve fsGroup entry {relative:?} without symlinks"))?;
+    let stat =
+        fstat(&handle).with_context(|| format!("inspect secured fsGroup entry {relative:?}"))?;
+    if stat.st_dev != root_device {
+        return Ok(None);
+    }
+
+    Ok(Some((handle, stat)))
+}
+
+fn directory_entries(handle: &Handle, relative: &Path) -> Result<Vec<OsString>> {
+    let directory = handle
+        .reopen(OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY | OpenFlags::O_NOFOLLOW)
+        .with_context(|| format!("open fsGroup directory handle for {relative:?}"))?;
+    let owned_fd: OwnedFd = directory.into();
+    let mut directory = Dir::from_fd(owned_fd)
+        .with_context(|| format!("read fsGroup directory handle for {relative:?}"))?;
+    let mut entries = Vec::new();
+    for entry in directory.iter() {
+        let entry = entry.with_context(|| format!("read child entry below {relative:?}"))?;
+        let name = entry.file_name().to_bytes();
+        if name == b"." || name == b".." {
+            continue;
         }
+        entries.push(OsString::from_vec(name.to_vec()));
+    }
+    Ok(entries)
+}
+
+fn apply_ownership_to_handle(
+    handle: &Handle,
+    stat: &FileStat,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    read_only: bool,
+) -> Result<()> {
+    let mut mask = if read_only { RO_MASK } else { RW_MASK };
+    let is_directory = SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR);
+    if is_directory {
         mask |= EXEC_MASK;
         mask |= MODE_SETGID;
     }
 
-    // We do not want to change the permission of the underlying file
-    // using symlink. Hence we skip symlinks from recursive ownership
-    // and permission changes.
-    if path.is_symlink() {
-        return Ok(());
-    }
+    // Reopen the already-resolved inode before changing ownership. This makes
+    // unsupported special files fail before any partial ownership mutation.
+    let permission_handle = if gid.is_some() {
+        Some(handle.reopen(if is_directory {
+            OpenFlags::O_RDONLY | OpenFlags::O_DIRECTORY | OpenFlags::O_NOFOLLOW
+        } else {
+            OpenFlags::O_RDONLY | OpenFlags::O_NONBLOCK | OpenFlags::O_NOFOLLOW
+        })?)
+    } else {
+        None
+    };
 
-    nix::unistd::chown(path, uid, gid)
+    fchownat(handle, "", uid, gid, AtFlags::AT_EMPTY_PATH)
         .context("change ownership during recursive fsGroup ownership")?;
 
-    if gid.is_some() {
-        let metadata = path
-            .metadata()
-            .context("inspect path after recursive fsGroup ownership")?;
-        let mut permission = metadata.permissions();
-        let target_mode = metadata.mode() | mask;
-        permission.set_mode(target_mode);
-        fs::set_permissions(path, permission)
+    if let Some(permission_handle) = permission_handle {
+        let current =
+            fstat(handle).context("inspect inode after recursive fsGroup ownership change")?;
+        let target_mode = Mode::from_bits_truncate(current.st_mode | mask);
+        fchmod(permission_handle, target_mode)
             .context("change permissions during recursive fsGroup ownership")?;
     }
 
     Ok(())
+}
+
+fn recursive_ownership_change_from_root(
+    root: &Root,
+    relative: &Path,
+    root_device: libc::dev_t,
+    uid: Option<Uid>,
+    gid: Option<Gid>,
+    read_only: bool,
+) -> Result<()> {
+    let Some((handle, stat)) = resolve_ownership_entry(root, relative, root_device)? else {
+        return Ok(());
+    };
+
+    if SFlag::from_bits_truncate(stat.st_mode).contains(SFlag::S_IFDIR) {
+        let entries = directory_entries(&handle, relative)?;
+        let expected_device = stat.st_dev;
+        let expected_inode = stat.st_ino;
+        drop(handle);
+
+        for entry in entries {
+            recursive_ownership_change_from_root(
+                root,
+                &relative.join(entry),
+                root_device,
+                uid,
+                gid,
+                read_only,
+            )?;
+        }
+
+        // A directory renamed or replaced while its children were traversed
+        // must not inherit authority from the stale handle.
+        let Some((handle, current)) = resolve_ownership_entry(root, relative, root_device)? else {
+            return Err(anyhow!(
+                "fsGroup directory changed identity during traversal: {relative:?}"
+            ));
+        };
+        if current.st_dev != expected_device || current.st_ino != expected_inode {
+            return Err(anyhow!(
+                "fsGroup directory changed identity during traversal: {relative:?}"
+            ));
+        }
+        return apply_ownership_to_handle(&handle, &current, uid, gid, read_only);
+    }
+
+    apply_ownership_to_handle(&handle, &stat, uid, gid, read_only)
 }
 
 #[cfg(test)]
@@ -645,7 +789,9 @@ mod tests {
     use nix::mount::MsFlags;
     use protocols::agent::FSGroup;
     use std::fs::File;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use std::os::unix::fs::symlink;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+    use std::thread;
     use tempfile::{tempdir, Builder};
     use test_utils::{
         skip_if_not_root, skip_loop_by_user, skip_loop_if_not_root, skip_loop_if_root, TestUserType,
@@ -1047,6 +1193,98 @@ mod tests {
 
         assert!(
             format!("{error:#}").contains("change ownership during recursive fsGroup ownership")
+        );
+    }
+
+    #[test]
+    fn test_recursive_ownership_change_never_follows_symlinks() {
+        let tempdir = tempdir().unwrap();
+        let mount_dir = tempdir.path().join("volume");
+        let inside = mount_dir.join("inside");
+        let outside = tempdir.path().join("outside");
+        fs::create_dir(&mount_dir).unwrap();
+        fs::write(&inside, "inside").unwrap();
+        fs::write(&outside, "outside").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+
+        symlink(&outside, mount_dir.join("absolute-link")).unwrap();
+        symlink("../outside", mount_dir.join("relative-link")).unwrap();
+        symlink(".", mount_dir.join("ancestor-cycle")).unwrap();
+
+        recursive_ownership_change(&mount_dir, None, Some(nix::unistd::getegid()), false).unwrap();
+
+        assert_eq!(
+            outside.metadata().unwrap().permissions().mode() & 0o777,
+            0o600,
+            "fsGroup traversal changed an out-of-volume symlink target"
+        );
+        assert_eq!(
+            inside.metadata().unwrap().permissions().mode() & RW_MASK,
+            RW_MASK,
+            "fsGroup traversal did not update a regular in-volume file"
+        );
+    }
+
+    #[test]
+    fn test_recursive_ownership_change_rejects_symlinked_root() {
+        let tempdir = tempdir().unwrap();
+        let mount_dir = tempdir.path().join("volume");
+        let mount_link = tempdir.path().join("volume-link");
+        fs::create_dir(&mount_dir).unwrap();
+        symlink(&mount_dir, &mount_link).unwrap();
+
+        let error =
+            recursive_ownership_change(&mount_link, None, Some(nix::unistd::getegid()), false)
+                .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("resolve fsGroup mount path without symlinks"),
+            "unexpected symlinked-root error: {:#}",
+            error,
+        );
+    }
+
+    #[test]
+    fn test_recursive_ownership_change_rename_race_cannot_escape_root() {
+        let tempdir = tempdir().unwrap();
+        let mount_dir = tempdir.path().join("volume");
+        let victim = mount_dir.join("victim");
+        let parked = mount_dir.join("victim-parked");
+        let outside = tempdir.path().join("outside");
+        fs::create_dir(&mount_dir).unwrap();
+        fs::create_dir(&victim).unwrap();
+        fs::write(victim.join("inside"), "inside").unwrap();
+        fs::write(&outside, "outside").unwrap();
+        fs::set_permissions(&outside, fs::Permissions::from_mode(0o600)).unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let racer_stop = stop.clone();
+        let racer_victim = victim.clone();
+        let racer_parked = parked.clone();
+        let racer_outside = outside.clone();
+        let racer = thread::spawn(move || {
+            while !racer_stop.load(Ordering::Relaxed) {
+                if fs::rename(&racer_victim, &racer_parked).is_ok() {
+                    let _ = symlink(&racer_outside, &racer_victim);
+                    thread::yield_now();
+                    let _ = fs::remove_file(&racer_victim);
+                    let _ = fs::rename(&racer_parked, &racer_victim);
+                }
+            }
+        });
+
+        for _ in 0..64 {
+            // A concurrent rename may make the operation inconclusive. It may
+            // never authorize the raced symlink target outside the root.
+            let _ =
+                recursive_ownership_change(&mount_dir, None, Some(nix::unistd::getegid()), false);
+        }
+        stop.store(true, Ordering::Relaxed);
+        racer.join().unwrap();
+
+        assert_eq!(
+            outside.metadata().unwrap().permissions().mode() & 0o777,
+            0o600,
+            "rename race changed an out-of-volume sentinel"
         );
     }
 
