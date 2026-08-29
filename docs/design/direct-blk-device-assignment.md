@@ -66,62 +66,9 @@ pub struct DirectVolumeMountInfo {
     pub fs_type: String,
     pub metadata: HashMap<String, String>,
     pub options: Vec<String>,
-    pub confidential_storage: Option<ConfidentialStorage>,
-}
-
-pub struct ConfidentialStorage {
-    pub profile: String,
-    pub volume_id: String,
-    pub key_uri: String,
 }
 ```
 Notes: given that the `mountInfo` is persisted to disk by the Kata runtime, it shouldn't contain any secrets (such as an SMB mount password).
-
-Confidential persistent storage uses the typed `confidential-storage` object,
-not driver options or vendor-specific metadata. Its initial fixed profile is:
-
-```json
-{
-  "volume-type": "directvol",
-  "device": "/dev/example",
-  "fstype": "confidential-storage",
-  "confidential-storage": {
-    "profile": "luks2-integrity-ext4",
-    "volume-id": "tenant/workload/volume",
-    "key-uri": "kbs:///tenant/storage/key"
-  }
-}
-```
-
-runtime-rs strictly parses and validates this complete object before attaching
-the device, then transports it to the guest as a dedicated Agent protocol
-message. The Agent authorizes it
-only when the exact profile, volume ID, and key URI tuple appears in the
-versioned `confidential_storage` registry in measured init-data. That registry
-is a JSON string under the init-data `data` table:
-
-```json
-{
-  "version": 1,
-  "volumes": [{
-    "profile": "luks2-integrity-ext4",
-    "volumeId": "tenant/workload/volume",
-    "keyUri": "kbs:///tenant/storage/key"
-  }]
-}
-```
-
-The outer `confidential-storage` fstype is a fail-closed discriminator, not the
-on-disk filesystem. An older runtime or Agent that does not understand the
-typed contract will fail instead of silently mounting a raw ext4 volume. The fixed
-profile asks CDH for persistent, journaled LUKS2 integrity and ext4 activation;
-it cannot be combined with filesystem-creation, ephemeral-encryption, sharing,
-or mount driver options. Its resize contract is deliberately unsupported and
-must fail without mutation until a separate profile defines safe growth.
-
-The KBS URI and stable volume ID are non-secret identifiers. Plaintext key
-material is released to CDH only inside the attested guest and is never included
-in `mountInfo`, Agent protocol fields, or driver options.
 
 ## Implementation Details
 

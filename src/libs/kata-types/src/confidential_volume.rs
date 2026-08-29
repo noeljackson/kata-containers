@@ -12,13 +12,68 @@ use std::path::{Component, Path};
 
 use anyhow::{anyhow, Result};
 use serde::de::{Error as _, MapAccess, Visitor};
-use serde::{Deserialize, Deserializer};
-
-use crate::mount::{validate_confidential_manifest_uri, ConfidentialStorageAccess};
+use serde::{Deserialize, Deserializer, Serialize};
+use sha2::{Digest, Sha256};
 
 const MAX_DECLARATION_BYTES: usize = 64 * 1024;
 const MAX_VOLUMES: usize = 32;
 const MAX_MOUNTS_PER_CONTAINER: usize = 32;
+const MANIFEST_URI_MAX_BYTES: usize = 2048;
+const MOUNT_NAME_PREFIX: &str = "confidential-";
+
+/// Fail-closed filesystem discriminator for confidential storage.
+pub const KATA_CONFIDENTIAL_STORAGE_FS_TYPE: &str = "confidential-storage";
+
+/// Access requested for a confidential volume.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConfidentialStorageAccess {
+    /// Mount the volume read-only.
+    ReadOnly,
+    /// Mount the volume read-write.
+    ReadWrite,
+}
+
+/// Validate an immutable local KBS resource URI used for a confidential-volume manifest.
+pub fn validate_confidential_manifest_uri(value: &str) -> Result<()> {
+    if value.len() <= "kbs:///".len()
+        || value.len() > MANIFEST_URI_MAX_BYTES
+        || !value.starts_with("kbs:///")
+        || value.contains(['?', '#'])
+    {
+        return Err(anyhow!(
+            "confidential storage manifest URI must be a canonical local KBS resource URI"
+        ));
+    }
+
+    let components: Vec<&str> = value["kbs:///".len()..].split('/').collect();
+    if components.len() != 3
+        || components.iter().any(|component| {
+            component.is_empty()
+                || matches!(*component, "." | "..")
+                || !component
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        })
+    {
+        return Err(anyhow!(
+            "confidential storage manifest URI must be a canonical local KBS resource URI"
+        ));
+    }
+
+    Ok(())
+}
+
+/// Return the stable sandbox-local mount name for an authorized manifest.
+pub fn confidential_storage_mount_name(manifest_uri: &str) -> Result<String> {
+    validate_confidential_manifest_uri(manifest_uri)?;
+    let digest = Sha256::digest(manifest_uri.as_bytes());
+    let digest = digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(format!("{MOUNT_NAME_PREFIX}{digest}"))
+}
 
 /// The fsGroup ownership behavior requested for a confidential filesystem.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
@@ -282,6 +337,25 @@ mod tests {
             declaration.mounts.0["workspace"],
             ["/home/workspace", "/workspace"]
         );
+    }
+
+    #[test]
+    fn confidential_mount_name_is_stable_and_opaque() {
+        let manifest_uri = "kbs:///tenant/storage-manifests/workspace-v1";
+
+        assert_eq!(
+            confidential_storage_mount_name(manifest_uri).unwrap(),
+            "confidential-1add35069081285fe11d1174dcfde93faf6097a48d3182b5f909c64ab3530bde"
+        );
+        assert_eq!(
+            confidential_storage_mount_name(manifest_uri).unwrap(),
+            confidential_storage_mount_name(manifest_uri).unwrap()
+        );
+        assert_ne!(
+            confidential_storage_mount_name(manifest_uri).unwrap(),
+            confidential_storage_mount_name("kbs:///tenant/storage-manifests/cache-v1").unwrap()
+        );
+        assert!(confidential_storage_mount_name("https://example.invalid/manifest").is_err());
     }
 
     #[test]

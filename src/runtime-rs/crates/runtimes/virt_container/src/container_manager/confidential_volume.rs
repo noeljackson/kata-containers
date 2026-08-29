@@ -11,10 +11,10 @@ use agent::types::{
 use anyhow::{anyhow, Context, Result};
 use kata_types::annotations::KATA_ANNO_CONFIDENTIAL_VOLUME;
 use kata_types::confidential_volume::{
-    parse_confidential_volume_declarations, ConfidentialFSGroupChangePolicy,
+    confidential_storage_mount_name, parse_confidential_volume_declarations,
+    ConfidentialFSGroupChangePolicy, KATA_CONFIDENTIAL_STORAGE_FS_TYPE,
 };
 use kata_types::k8s;
-use kata_types::mount::{confidential_storage_mount_name, KATA_CONFIDENTIAL_STORAGE_FS_TYPE};
 use oci_spec::runtime as oci;
 use resource::cdi_devices::ContainerDevice;
 
