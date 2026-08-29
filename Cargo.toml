@@ -190,6 +190,7 @@ netlink-packet-route = "0.33.0"
 netlink-sys = { features = ["tokio_socket"], version = "0.9.0" }
 netns-rs = "0.1.0"
 nix = { features = [
+  "dir",
   "event",
   "feature",
   "fs",
