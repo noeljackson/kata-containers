@@ -13,10 +13,8 @@ use hypervisor::{
     },
     BlockConfigModern, BlockDeviceAio,
 };
-use kata_types::mount::{
-    confidential_storage_mount_name, ConfidentialStorageAccess, DirectVolumeMountInfo,
-    KATA_CONFIDENTIAL_STORAGE_FS_TYPE,
-};
+use kata_types::confidential_volume::KATA_CONFIDENTIAL_STORAGE_FS_TYPE;
+use kata_types::mount::DirectVolumeMountInfo;
 use nix::sys::{stat, stat::SFlag};
 use oci_spec::runtime as oci;
 use tokio::sync::RwLock;
@@ -32,21 +30,21 @@ pub(crate) struct RawblockVolume {
     storage: Option<agent::Storage>,
     mount: oci::Mount,
     device_id: String,
-    device_lifetime: DeviceLifetime,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum DeviceLifetime {
-    Container,
-    Sandbox,
-}
-
-fn device_lifetime(mount_info: &DirectVolumeMountInfo) -> Result<DeviceLifetime> {
-    if mount_info.validated_confidential_storage()?.is_some() {
-        Ok(DeviceLifetime::Sandbox)
-    } else {
-        Ok(DeviceLifetime::Container)
+fn validate_mount_info(mount_info: &DirectVolumeMountInfo) -> Result<()> {
+    if mount_info.volume_type != KATA_DIRECT_VOLUME_TYPE {
+        return Err(anyhow!(
+            "volume type {:?} is invalid",
+            mount_info.volume_type
+        ));
     }
+    if mount_info.fs_type == KATA_CONFIDENTIAL_STORAGE_FS_TYPE {
+        return Err(anyhow!(
+            "confidential storage requires a raw Block PVC through volumeDevices; DirectVolume is unsupported"
+        ));
+    }
+    Ok(())
 }
 
 /// RawblockVolume for raw block volume
@@ -58,16 +56,9 @@ impl RawblockVolume {
         read_only: bool,
         sid: &str,
     ) -> Result<Self> {
-        let device_lifetime = device_lifetime(mount_info)?;
         let blkdev_info = get_block_device_info(d).await;
 
-        // check volume type
-        if mount_info.volume_type != KATA_DIRECT_VOLUME_TYPE {
-            return Err(anyhow!(
-                "volume type {:?} is invalid",
-                mount_info.volume_type
-            ));
-        }
+        validate_mount_info(mount_info)?;
 
         let fstat = stat::stat(mount_info.device.as_str())
             .with_context(|| format!("stat volume device file: {}", mount_info.device.clone()))?;
@@ -97,8 +88,6 @@ impl RawblockVolume {
                     false
                 }));
 
-        validate_confidential_access(mount_info, read_only)?;
-
         let block_config = BlockConfigModern {
             path_on_host: mount_info.device.clone(),
             is_readonly: read_only,
@@ -116,88 +105,23 @@ impl RawblockVolume {
             .await
             .context("do handle device failed.")?;
 
-        let stable_mount_name = mount_info
-            .validated_confidential_storage()?
-            .map(|request| confidential_storage_mount_name(&request.manifest_uri))
-            .transpose()?;
-        let mut block_volume = handle_block_volume(
+        let block_volume = handle_block_volume(
             device_info,
             m,
             read_only,
             sid,
             &mount_info.fs_type,
             Some(&mount_info.options),
-            stable_mount_name.as_deref(),
         )
         .await
         .context("do handle block volume failed")?;
-
-        configure_confidential_storage(&mut block_volume.0, mount_info)?;
 
         Ok(Self {
             storage: Some(block_volume.0),
             mount: block_volume.1,
             device_id: block_volume.2,
-            device_lifetime,
         })
     }
-}
-
-fn validate_confidential_access(mount_info: &DirectVolumeMountInfo, read_only: bool) -> Result<()> {
-    let Some(request) = mount_info.validated_confidential_storage()? else {
-        return Ok(());
-    };
-
-    match (request.requested_access, read_only) {
-        (ConfidentialStorageAccess::ReadWrite, false) => Ok(()),
-        (ConfidentialStorageAccess::ReadWrite, true) => Err(anyhow!(
-            "confidential storage requested readWrite access for a read-only device"
-        )),
-        (ConfidentialStorageAccess::ReadOnly, _) => Err(anyhow!(
-            "confidential storage readOnly access is not supported"
-        )),
-    }
-}
-
-fn configure_confidential_storage(
-    storage: &mut agent::Storage,
-    mount_info: &DirectVolumeMountInfo,
-) -> Result<()> {
-    let Some(request) = mount_info.validated_confidential_storage()? else {
-        return Ok(());
-    };
-
-    if storage.fs_type != KATA_CONFIDENTIAL_STORAGE_FS_TYPE {
-        return Err(anyhow!(
-            "confidential storage discriminator was not preserved"
-        ));
-    }
-
-    let requested_access = match request.requested_access {
-        ConfidentialStorageAccess::ReadOnly => agent::ConfidentialStorageAccess::ReadOnly,
-        ConfidentialStorageAccess::ReadWrite => agent::ConfidentialStorageAccess::ReadWrite,
-    };
-    storage.confidential_storage = Some(agent::ConfidentialStorage {
-        manifest_uri: request.manifest_uri.clone(),
-        requested_access,
-    });
-
-    if let Some(group_id) = mount_info.metadata.get("fsGroup") {
-        let group_change_policy = match mount_info
-            .metadata
-            .get("fsGroupChangePolicy")
-            .map(String::as_str)
-        {
-            Some("OnRootMismatch") => agent::FSGroupChangePolicy::OnRootMismatch,
-            _ => agent::FSGroupChangePolicy::Always,
-        };
-        storage.fs_group = Some(agent::FSGroup {
-            group_id: group_id.parse::<u32>()?,
-            group_change_policy,
-        });
-    }
-
-    Ok(())
 }
 
 #[async_trait]
@@ -217,13 +141,6 @@ impl Volume for RawblockVolume {
     }
 
     async fn cleanup(&self, device_manager: &RwLock<DeviceManager>) -> Result<()> {
-        // CDH keeps a persistent confidential mapper alive for the sandbox. Detaching its
-        // backing device during container cleanup would leave that mapper bound to a device
-        // that no longer exists. Keep the device attached until the sandbox VM is destroyed.
-        if self.device_lifetime == DeviceLifetime::Sandbox {
-            return Ok(());
-        }
-
         device_manager
             .write()
             .await
@@ -237,95 +154,28 @@ impl Volume for RawblockVolume {
 }
 
 #[cfg(test)]
-mod confidential_storage_tests {
-    use std::collections::HashMap;
-
-    use kata_types::mount::{ConfidentialStorage, KATA_CONFIDENTIAL_STORAGE_VOLUME_TYPE};
-
+mod tests {
     use super::*;
 
-    fn confidential_mount_info() -> DirectVolumeMountInfo {
-        DirectVolumeMountInfo {
-            volume_type: KATA_CONFIDENTIAL_STORAGE_VOLUME_TYPE.to_string(),
-            device: "/dev/sda".to_string(),
-            fs_type: KATA_CONFIDENTIAL_STORAGE_FS_TYPE.to_string(),
-            metadata: HashMap::new(),
-            options: Vec::new(),
-            confidential_storage: Some(ConfidentialStorage {
-                manifest_uri: "kbs:///tenant/storage-manifests/volume-1-v1".to_string(),
-                requested_access: ConfidentialStorageAccess::ReadWrite,
-            }),
-        }
-    }
-
     #[test]
-    fn configures_typed_confidential_storage_request() {
-        let mut mount_info = confidential_mount_info();
-        mount_info
-            .metadata
-            .insert("fsGroup".to_string(), "3000".to_string());
-        mount_info.metadata.insert(
-            "fsGroupChangePolicy".to_string(),
-            "OnRootMismatch".to_string(),
-        );
-        let mut storage = agent::Storage {
+    fn confidential_direct_volume_is_rejected() {
+        let mount_info = DirectVolumeMountInfo {
+            volume_type: KATA_DIRECT_VOLUME_TYPE.to_string(),
             fs_type: KATA_CONFIDENTIAL_STORAGE_FS_TYPE.to_string(),
             ..Default::default()
         };
 
-        configure_confidential_storage(&mut storage, &mount_info).unwrap();
-
-        assert_eq!(
-            storage.confidential_storage,
-            Some(agent::ConfidentialStorage {
-                manifest_uri: "kbs:///tenant/storage-manifests/volume-1-v1".to_string(),
-                requested_access: agent::ConfidentialStorageAccess::ReadWrite,
-            })
-        );
-        assert_eq!(
-            storage.fs_group,
-            Some(agent::FSGroup {
-                group_id: 3000,
-                group_change_policy: agent::FSGroupChangePolicy::OnRootMismatch,
-            })
-        );
+        assert!(validate_mount_info(&mount_info).is_err());
     }
 
     #[test]
-    fn rejects_read_only_transport_for_read_write_request() {
-        assert!(validate_confidential_access(&confidential_mount_info(), true).is_err());
-    }
-
-    #[test]
-    fn rejects_plaintext_discriminator_downgrade() {
-        let mut mount_info = confidential_mount_info();
-        mount_info.fs_type = "ext4".to_string();
-        let mut storage = agent::Storage::default();
-
-        assert!(configure_confidential_storage(&mut storage, &mount_info).is_err());
-        assert!(storage.confidential_storage.is_none());
-    }
-
-    #[test]
-    fn confidential_device_lifetime_is_sandbox_scoped() {
-        assert_eq!(
-            device_lifetime(&confidential_mount_info()).unwrap(),
-            DeviceLifetime::Sandbox
-        );
-    }
-
-    #[test]
-    fn ordinary_direct_volume_device_lifetime_is_container_scoped() {
+    fn ordinary_direct_volume_remains_supported() {
         let mount_info = DirectVolumeMountInfo {
             volume_type: KATA_DIRECT_VOLUME_TYPE.to_string(),
-            device: "/dev/sda".to_string(),
             fs_type: "ext4".to_string(),
             ..Default::default()
         };
 
-        assert_eq!(
-            device_lifetime(&mount_info).unwrap(),
-            DeviceLifetime::Container
-        );
+        validate_mount_info(&mount_info).unwrap();
     }
 }

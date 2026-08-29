@@ -18,7 +18,7 @@ pub mod direct_volume;
 use crate::volume::{direct_volume::is_direct_volume, share_fs_volume::VolumeManager};
 pub mod direct_volumes;
 
-use std::{collections::HashMap, sync::Arc, vec::Vec};
+use std::{sync::Arc, vec::Vec};
 
 use self::hugepage::{get_huge_page_limits_map, get_huge_page_option};
 use crate::{share_fs::ShareFs, volume::block_volume::is_block_volume};
@@ -86,10 +86,6 @@ impl VolumeResource {
         let emptydir_mode = ctx.emptydir_mode;
         let fs_sharing_supported = ctx.fs_sharing_supported;
         let mut volumes: Vec<Arc<dyn Volume>> = vec![];
-        let mut confidential_direct_volumes: HashMap<
-            String,
-            direct_volume::ConfidentialDirectVolumeBinding,
-        > = HashMap::new();
         let oci_mounts = &spec.mounts().clone().unwrap_or_default();
         info!(sl!(), " oci mount is : {:?}", oci_mounts.clone());
         // handle mounts
@@ -141,44 +137,12 @@ impl VolumeResource {
                 )
             } else if is_direct_volume(m)? {
                 // handle direct volumes
-                let (volume_path, mount_info) = direct_volume::direct_volume_mount_info(m)
-                    .context("read direct volume mount metadata")?;
-                if mount_info.validated_confidential_storage()?.is_some() {
-                    if let Some(binding) = confidential_direct_volumes.get_mut(&volume_path) {
-                        binding
-                            .reuse(m, &mount_info, read_only)
-                            .context("reuse confidential direct volume")?
-                    } else {
-                        let handled = direct_volume::handle_direct_volume(
-                            d,
-                            m,
-                            &volume_path,
-                            &mount_info,
-                            read_only,
-                            sid,
-                        )
-                        .await
-                        .context("handle confidential direct volume")?;
-                        let binding = handled.confidential_binding.ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "confidential direct volume did not produce a reusable binding"
-                            )
-                        })?;
-                        confidential_direct_volumes.insert(volume_path, binding);
-                        handled.volume
-                    }
-                } else {
-                    direct_volume::handle_direct_volume(
-                        d,
-                        m,
-                        &volume_path,
-                        &mount_info,
-                        read_only,
-                        sid,
-                    )
+                match direct_volume::handle_direct_volume(d, m, read_only, sid)
                     .await
                     .context("handle direct volume")?
-                    .volume
+                {
+                    Some(directvol) => directvol,
+                    None => continue,
                 }
             } else if let Some(options) =
                 get_huge_page_option(m).context("failed to check huge page")?

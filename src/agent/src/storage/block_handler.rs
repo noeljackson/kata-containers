@@ -11,15 +11,15 @@ use std::path::Path;
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
+use kata_types::confidential_volume::{
+    confidential_storage_mount_name, validate_confidential_manifest_uri,
+};
 #[cfg(target_arch = "s390x")]
 use kata_types::device::DRIVER_BLK_CCW_TYPE;
 use kata_types::device::{
     DRIVER_BLK_MMIO_TYPE, DRIVER_BLK_PCI_TYPE, DRIVER_NVDIMM_TYPE, DRIVER_SCSI_TYPE,
 };
-use kata_types::mount::{
-    confidential_storage_mount_name, validate_confidential_manifest_uri, StorageDevice,
-    KATA_BLOCK_VOLUME_CREATE_FS,
-};
+use kata_types::mount::{StorageDevice, KATA_BLOCK_VOLUME_CREATE_FS};
 use nix::sys::stat::{major, minor};
 use protocols::{
     agent::{ConfidentialStorageAccess, Storage},
