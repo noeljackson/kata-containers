@@ -9,7 +9,6 @@ use std::ffi::OsString;
 use std::fs;
 use std::os::fd::OwnedFd;
 use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 use std::sync::Arc;
 
@@ -603,6 +602,7 @@ pub fn set_ownership(logger: &Logger, storage: &Storage) -> Result<()> {
 }
 
 #[instrument]
+#[cfg(test)]
 pub fn recursive_ownership_change(
     path: &Path,
     uid: Option<Uid>,
@@ -789,7 +789,7 @@ mod tests {
     use nix::mount::MsFlags;
     use protocols::agent::FSGroup;
     use std::fs::File;
-    use std::os::unix::fs::symlink;
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
     use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::thread;
     use tempfile::{tempdir, Builder};
