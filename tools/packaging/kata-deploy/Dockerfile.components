@@ -5,38 +5,54 @@
 
 #### Nydus snapshotter & nydus image
 
-FROM alpine:3.22 AS nydus-binary-downloader
+FROM --platform=$BUILDPLATFORM golang:1.26.7-alpine3.23@sha256:b17af760035fc2f338eed92d448a6c67f2d45438844fc6c60678fa5f99e44b57 AS nydus-source-builder
 
-# When STATIC_NYDUS_SNAPSHOTTER=yes, download the statically linked release
-# asset (nydus-snapshotter-<ver>-linux-static.tar.gz) instead of the per-arch
-# (dynamically, glibc-linked) one. The static binaries run on musl-only hosts
-# that have no glibc dynamic loader. The static asset is currently published
-# for x86_64/amd64 only.
-ARG STATIC_NYDUS_SNAPSHOTTER=""
+ARG TARGETARCH
+ARG TARGETOS
 
 COPY versions.yaml /tmp/versions.yaml
 
 RUN \
-	set -e && \
+	set -eux && \
 	apk add --no-cache curl yq-go && \
 	NYDUS_SNAPSHOTTER_VERSION="$(yq eval -e '.externals.nydus-snapshotter.version | explode(.)' /tmp/versions.yaml)" && \
 	NYDUS_SNAPSHOTTER_REPO="$(yq eval -e '.externals.nydus-snapshotter.url | explode(.)' /tmp/versions.yaml)" && \
-	mkdir -p /opt/nydus-snapshotter && \
-	ARCH="$(uname -m)" && \
-	if [ "${ARCH}" = "x86_64" ]; then ARCH=amd64 ; fi && \
-	if [ "${ARCH}" = "aarch64" ]; then ARCH=arm64; fi && \
-	if [ "${STATIC_NYDUS_SNAPSHOTTER}" = "yes" ]; then \
-		if [ "${ARCH}" != "amd64" ]; then \
-			echo "STATIC_NYDUS_SNAPSHOTTER is only supported on amd64 (no static asset is published for ${ARCH})" >&2; \
-			exit 1; \
-		fi; \
-		NYDUS_SNAPSHOTTER_TARBALL="nydus-snapshotter-${NYDUS_SNAPSHOTTER_VERSION}-linux-static.tar.gz"; \
-	else \
-		NYDUS_SNAPSHOTTER_TARBALL="nydus-snapshotter-${NYDUS_SNAPSHOTTER_VERSION}-linux-${ARCH}.tar.gz"; \
-	fi && \
-	curl -fOL --progress-bar "${NYDUS_SNAPSHOTTER_REPO}/releases/download/${NYDUS_SNAPSHOTTER_VERSION}/${NYDUS_SNAPSHOTTER_TARBALL}" && \
-	tar xvzpf "${NYDUS_SNAPSHOTTER_TARBALL}" -C /opt/nydus-snapshotter && \
-	rm "${NYDUS_SNAPSHOTTER_TARBALL}"
+	NYDUS_SNAPSHOTTER_REVISION="$(yq eval -e '.externals.nydus-snapshotter.revision | explode(.)' /tmp/versions.yaml)" && \
+	NYDUS_SNAPSHOTTER_SHA256="$(yq eval -e '.externals.nydus-snapshotter.archive-sha256 | explode(.)' /tmp/versions.yaml)" && \
+	curl -fL --proto '=https' --tlsv1.2 \
+		-o /tmp/nydus-snapshotter.tar.gz \
+		"${NYDUS_SNAPSHOTTER_REPO}/archive/${NYDUS_SNAPSHOTTER_REVISION}.tar.gz" && \
+	echo "${NYDUS_SNAPSHOTTER_SHA256}  /tmp/nydus-snapshotter.tar.gz" | sha256sum -c - && \
+	mkdir -p /src /opt/nydus-snapshotter/bin && \
+	tar -xzf /tmp/nydus-snapshotter.tar.gz --strip-components=1 -C /src && \
+	cd /src && \
+	go get \
+		github.com/cilium/ebpf@v0.22.0 \
+		github.com/klauspost/compress@v1.18.7 \
+		go.opentelemetry.io/otel@v1.44.0 \
+		go.opentelemetry.io/otel/metric@v1.44.0 \
+		go.opentelemetry.io/otel/trace@v1.44.0 \
+		golang.org/x/crypto@v0.55.0 \
+		golang.org/x/net@v0.57.0 && \
+	go mod tidy && \
+	test "$(go list -m -f '{{.Version}}' github.com/cilium/ebpf)" = v0.22.0 && \
+	test "$(go list -m -f '{{.Version}}' github.com/klauspost/compress)" = v1.18.7 && \
+	test "$(go list -m -f '{{.Version}}' go.opentelemetry.io/otel)" = v1.44.0 && \
+	test "$(go list -m -f '{{.Version}}' golang.org/x/crypto)" = v0.55.0 && \
+	test "$(go list -m -f '{{.Version}}' golang.org/x/net)" = v0.57.0 && \
+	go test ./cmd/containerd-nydus-grpc ./cmd/nydus-overlayfs && \
+	LDFLAGS="-s -w -X github.com/containerd/nydus-snapshotter/version.Version=${NYDUS_SNAPSHOTTER_VERSION} -X github.com/containerd/nydus-snapshotter/version.Revision=${NYDUS_SNAPSHOTTER_REVISION} -X github.com/containerd/nydus-snapshotter/version.BuildTimestamp=2026-08-24T09:55:44Z" && \
+	CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
+		go build -trimpath -buildvcs=false -ldflags "${LDFLAGS}" \
+		-o /opt/nydus-snapshotter/bin/containerd-nydus-grpc ./cmd/containerd-nydus-grpc && \
+	CGO_ENABLED=0 GOOS="${TARGETOS:-linux}" GOARCH="${TARGETARCH}" \
+		go build -trimpath -buildvcs=false -ldflags "${LDFLAGS}" \
+		-o /opt/nydus-snapshotter/bin/nydus-overlayfs ./cmd/nydus-overlayfs && \
+	rm /tmp/nydus-snapshotter.tar.gz
+
+FROM scratch AS nydus-binary-downloader
+
+COPY --from=nydus-source-builder /opt/nydus-snapshotter /opt/nydus-snapshotter
 
 #### Build binary package
 FROM ubuntu:22.04 AS rust-builder

@@ -59,16 +59,12 @@ build_kata_deploy_binary() {
 }
 
 build_nydus_snapshotter_for_coco_guest_pull() {
-	# The kata Go host binaries are built static by default (see
-	# static-build/shim-v2). STATIC_RUNTIME=yes additionally pulls the
-	# statically linked nydus-snapshotter binaries instead of the glibc-linked
-	# per-arch ones, producing a fully musl-compatible payload. The static
-	# nydus asset is published for amd64 only.
-	local static_nydus_snapshotter="${STATIC_RUNTIME:-}"
-
+	# Build the exact source revision and security-pinned module closure into
+	# static binaries. This keeps the payload independent of a host glibc and
+	# prevents an old release asset's compiler/dependencies from escaping the
+	# repository's immutable source contract.
 	docker buildx build \
 		--target nydus-binary-downloader \
-		--build-arg "STATIC_NYDUS_SNAPSHOTTER=${static_nydus_snapshotter}" \
 		--output "type=local,dest=${build_dir}/nydus-snapshotter-out" \
 		-f "${repo_root_dir}/tools/packaging/kata-deploy/Dockerfile.components" \
 		"${repo_root_dir}"
