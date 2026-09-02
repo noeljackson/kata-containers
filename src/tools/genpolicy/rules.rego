@@ -67,6 +67,8 @@ S_NAME_KEY = "io.kubernetes.cri.sandbox-name"
 S_NAMESPACE_KEY = "io.kubernetes.cri.sandbox-namespace"
 CDI_VFIO_ANNOTATION_PREFIX = "cdi.k8s.io/vfio"
 VFIO_PCI_ADDRESS_REGEX = "^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[01][0-9a-fA-F]\\.[0-7]=[0-9a-fA-F]{2}/[0-9a-fA-F]{2}$"
+CONFIDENTIAL_MAPPER_PREFIX = "/dev/mapper/coco-pv-"
+VOLUME_BLOCK_DEVICE_TYPES = {"blk", "blk-ccw", "mmioblk", "nvdimm", "scsi"}
 
 CreateContainerRequest := {"ops": ops, "allowed": true} if {
     # Check if the input request should be rejected even before checking the
@@ -490,7 +492,7 @@ allow_devices(p_devices, i_devices, i_oci) if {
     p_volume_devices := [d | d := p_devices[_]; d.container_path != vfio_device_path]
     i_volume_devices := [d | d := i_devices[_]; not startswith(d.container_path, vfio_device_path)]
     print("allow_devices: p_volume_devices =", p_volume_devices, "i_volume_devices =", i_volume_devices)
-    allow_volume_devices(p_volume_devices, i_volume_devices)
+    allow_volume_devices(p_volume_devices, i_volume_devices, i_oci)
 
     p_vfio_devices := [d | d := p_devices[_]; d.container_path == vfio_device_path]
     i_vfio_devices := [d | d := i_devices[_]; startswith(d.container_path, vfio_device_path)]
@@ -500,15 +502,50 @@ allow_devices(p_devices, i_devices, i_oci) if {
     print("allow_devices: true")
 }
 
-allow_volume_devices(p_volume_devices, i_volume_devices) if {
+allow_volume_devices(p_volume_devices, i_volume_devices, i_oci) if {
     print("allow_volume_devices: start")
 
     every i_volume_device in i_volume_devices {
-        some p_device in p_volume_devices
-        p_device.container_path == i_volume_device.container_path
+        allow_volume_device(p_volume_devices, i_volume_device, i_oci)
     }
 
     print("allow_volume_devices: true")
+}
+
+allow_volume_device(p_volume_devices, i_volume_device, i_oci) if {
+    some p_device in p_volume_devices
+    p_device.container_path == i_volume_device.container_path
+
+    i_volume_device.type_ in VOLUME_BLOCK_DEVICE_TYPES
+    volume_device_field_matches(p_device.type_, i_volume_device.type_)
+    volume_device_field_matches(p_device.id, i_volume_device.id)
+    volume_device_field_matches(p_device.vm_path, i_volume_device.vm_path)
+    volume_device_has_source(i_volume_device)
+    not startswith(i_volume_device.vm_path, CONFIDENTIAL_MAPPER_PREFIX)
+    i_volume_device.options == p_device.options
+
+    matching_oci_devices := [device |
+        device := i_oci.Linux.Devices[_]
+        device.Path == i_volume_device.container_path
+    ]
+    count(matching_oci_devices) == 1
+    matching_oci_devices[0].Type == "b"
+}
+
+volume_device_field_matches(expected, actual) if {
+    expected == ""
+}
+
+volume_device_field_matches(expected, actual) if {
+    expected == actual
+}
+
+volume_device_has_source(device) if {
+    device.id != ""
+}
+
+volume_device_has_source(device) if {
+    device.vm_path != ""
 }
 
 allow_vfio_devices(p_vfio_devices, i_vfio_devices, i_oci) if {
@@ -768,6 +805,9 @@ allow_linux_devices(p_devices, i_devices) if {
         print("allow_linux_devices: i_device =", i_device)
         some p_device in p_devices
         i_device.Path == p_device.Path
+        i_device.Type == p_device.Type
+        i_device.Major >= 0
+        i_device.Minor >= 0
     }
     print("allow_linux_devices: true")
 }
