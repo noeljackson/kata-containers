@@ -14,6 +14,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use kata_sys_util::mount::{create_mount_destination, parse_mount_options};
+use kata_types::confidential_volume::KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT;
+use kata_types::device::DRIVER_VIRTIOFS_TYPE;
 use kata_types::mount::{StorageDevice, StorageHandlerManager, KATA_SHAREDFS_GUEST_PREMOUNT_TAG};
 use nix::dir::Dir;
 use nix::fcntl::AtFlags;
@@ -50,6 +52,65 @@ const RW_MASK: u32 = 0o660;
 const RO_MASK: u32 = 0o440;
 const EXEC_MASK: u32 = 0o110;
 const MODE_SETGID: u32 = 0o2000;
+
+#[derive(Clone, Copy, Debug)]
+struct MountTopologyEntry<'a> {
+    mount_point: &'a Path,
+    fs_type: &'a str,
+    mount_source: Option<&'a str>,
+}
+
+fn validate_confidential_mount_topology<'a>(
+    mounts: impl IntoIterator<Item = MountTopologyEntry<'a>>,
+) -> Result<()> {
+    let plaintext_root = Path::new(KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT);
+    let mut covering_mount_seen = false;
+
+    for mount in mounts {
+        if !plaintext_root.starts_with(mount.mount_point) {
+            continue;
+        }
+        covering_mount_seen = true;
+        let host_shared = matches!(mount.fs_type, "virtiofs" | "fuse.virtiofs" | "9p")
+            || mount.mount_source == Some(KATA_SHAREDFS_GUEST_PREMOUNT_TAG);
+        if host_shared {
+            return Err(anyhow!(
+                "confidential storage plaintext root is covered by host-shared mount {:?} (type {:?}, source {:?})",
+                mount.mount_point,
+                mount.fs_type,
+                mount.mount_source
+            ));
+        }
+    }
+
+    if !covering_mount_seen {
+        return Err(anyhow!(
+            "confidential storage plaintext mount topology is ambiguous"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_current_confidential_mount_topology() -> Result<()> {
+    let process =
+        procfs::process::Process::myself().context("open the kata-agent mount namespace")?;
+    let mounts = process
+        .mountinfo()
+        .context("read the kata-agent mount topology")?;
+    validate_confidential_mount_topology(mounts.iter().map(|mount| MountTopologyEntry {
+        mount_point: &mount.mount_point,
+        fs_type: &mount.fs_type,
+        mount_source: mount.mount_source.as_deref(),
+    }))
+}
+
+fn storage_exports_confidential_mount_root(storage: &Storage) -> bool {
+    let plaintext_root = Path::new(KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT);
+    plaintext_root.starts_with(Path::new(&storage.mount_point))
+        && (storage.driver == DRIVER_VIRTIOFS_TYPE
+            || matches!(storage.fstype.as_str(), "virtiofs" | "fuse.virtiofs" | "9p")
+            || storage.source == KATA_SHAREDFS_GUEST_PREMOUNT_TAG)
+}
 
 #[derive(Debug)]
 pub struct StorageContext<'a> {
@@ -364,6 +425,18 @@ pub async fn add_storages(
     // invalid entry from leaving an earlier volume mounted or activated.
     for storage in &storages {
         block_handler::validate_confidential_storage_contract(storage)?;
+    }
+    let requests_confidential_storage = storages
+        .iter()
+        .any(|storage| storage.confidential_storage.is_some());
+    let requests_host_shared_plaintext_root =
+        storages.iter().any(storage_exports_confidential_mount_root);
+    sandbox.lock().await.admit_confidential_mount_topology(
+        requests_confidential_storage,
+        requests_host_shared_plaintext_root,
+    )?;
+    if requests_confidential_storage {
+        validate_current_confidential_mount_topology()?;
     }
 
     sandbox
@@ -1007,6 +1080,143 @@ mod tests {
     use test_utils::{
         skip_if_not_root, skip_loop_by_user, skip_loop_if_not_root, skip_loop_if_root, TestUserType,
     };
+
+    #[test]
+    fn confidential_mount_topology_accepts_guest_only_ancestors() {
+        let root = Path::new("/");
+        let run = Path::new("/run");
+        let unrelated_share = Path::new("/mnt/host-share");
+        validate_confidential_mount_topology([
+            MountTopologyEntry {
+                mount_point: root,
+                fs_type: "ext4",
+                mount_source: Some("/dev/vda1"),
+            },
+            MountTopologyEntry {
+                mount_point: run,
+                fs_type: "tmpfs",
+                mount_source: Some("tmpfs"),
+            },
+            MountTopologyEntry {
+                mount_point: unrelated_share,
+                fs_type: "virtiofs",
+                mount_source: Some(KATA_SHAREDFS_GUEST_PREMOUNT_TAG),
+            },
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn confidential_mount_topology_rejects_host_shared_ancestors() {
+        for (mount_point, fs_type, mount_source) in [
+            (
+                "/run/kata-containers/shared",
+                "virtiofs",
+                Some(KATA_SHAREDFS_GUEST_PREMOUNT_TAG),
+            ),
+            (
+                "/run/kata-containers/shared/containers",
+                "fuse.virtiofs",
+                Some("inline-share"),
+            ),
+            (
+                KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT,
+                "9p",
+                Some("host-passthrough"),
+            ),
+            ("/run", "ext4", Some(KATA_SHAREDFS_GUEST_PREMOUNT_TAG)),
+        ] {
+            let error = validate_confidential_mount_topology([
+                MountTopologyEntry {
+                    mount_point: Path::new("/"),
+                    fs_type: "ext4",
+                    mount_source: Some("/dev/vda1"),
+                },
+                MountTopologyEntry {
+                    mount_point: Path::new(mount_point),
+                    fs_type,
+                    mount_source,
+                },
+            ])
+            .unwrap_err();
+            assert!(error.to_string().contains("host-shared mount"));
+        }
+    }
+
+    #[test]
+    fn confidential_mount_topology_rejects_missing_ancestor_evidence() {
+        let error = validate_confidential_mount_topology([MountTopologyEntry {
+            mount_point: Path::new("/mnt/unrelated"),
+            fs_type: "tmpfs",
+            mount_source: Some("tmpfs"),
+        }])
+        .unwrap_err();
+        assert!(error.to_string().contains("topology is ambiguous"));
+    }
+
+    #[test]
+    fn classifies_only_host_shares_that_cover_the_plaintext_root() {
+        for storage in [
+            Storage {
+                driver: DRIVER_VIRTIOFS_TYPE.to_string(),
+                mount_point: "/run/kata-containers/shared/containers".to_string(),
+                ..Default::default()
+            },
+            Storage {
+                fstype: "9p".to_string(),
+                mount_point: KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT.to_string(),
+                ..Default::default()
+            },
+            Storage {
+                source: KATA_SHAREDFS_GUEST_PREMOUNT_TAG.to_string(),
+                mount_point: "/run".to_string(),
+                ..Default::default()
+            },
+        ] {
+            assert!(storage_exports_confidential_mount_root(&storage));
+        }
+
+        for storage in [
+            Storage {
+                fstype: "tmpfs".to_string(),
+                mount_point: "/run".to_string(),
+                ..Default::default()
+            },
+            Storage {
+                driver: DRIVER_VIRTIOFS_TYPE.to_string(),
+                mount_point: "/mnt/unrelated".to_string(),
+                ..Default::default()
+            },
+            Storage {
+                driver: DRIVER_VIRTIOFS_TYPE.to_string(),
+                mount_point: format!("{KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT}/child"),
+                ..Default::default()
+            },
+        ] {
+            assert!(!storage_exports_confidential_mount_root(&storage));
+        }
+    }
+
+    #[tokio::test]
+    async fn confidential_and_host_shared_requests_fail_closed_in_either_order() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+
+        let mut shared_first = Sandbox::new(&logger).unwrap();
+        shared_first
+            .admit_confidential_mount_topology(false, true)
+            .unwrap();
+        assert!(shared_first
+            .admit_confidential_mount_topology(true, false)
+            .is_err());
+
+        let mut confidential_first = Sandbox::new(&logger).unwrap();
+        confidential_first
+            .admit_confidential_mount_topology(true, false)
+            .unwrap();
+        assert!(confidential_first
+            .admit_confidential_mount_topology(false, true)
+            .is_err());
+    }
 
     fn add_ready_storage(
         sandbox: &mut Sandbox,
