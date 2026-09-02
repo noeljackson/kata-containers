@@ -2,7 +2,6 @@
 
 //! Convert opted-in Kubernetes raw block devices into typed guest-confidential storage.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use agent::types::{
@@ -14,18 +13,75 @@ use kata_types::confidential_volume::{
     confidential_storage_mount_name, parse_confidential_volume_declarations,
     ConfidentialFSGroupChangePolicy, KATA_CONFIDENTIAL_STORAGE_FS_TYPE,
 };
+use kata_types::device::{DRIVER_BLK_PCI_TYPE, DRIVER_SCSI_TYPE};
 use kata_types::k8s;
 use oci_spec::runtime as oci;
 use resource::cdi_devices::ContainerDevice;
 
 const CONFIDENTIAL_MOUNT_ROOT: &str = "/run/kata-containers/shared/containers/passthrough";
+const CONFIDENTIAL_MAPPER_PREFIX: &str = "/dev/mapper/coco-pv-";
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConsumedDeviceIdentity {
+    id: String,
+    field_type: String,
+    vm_path: String,
+    container_path: String,
+    options: Vec<String>,
+}
+
+impl From<&agent::types::Device> for ConsumedDeviceIdentity {
+    fn from(device: &agent::types::Device) -> Self {
+        Self {
+            id: device.id.clone(),
+            field_type: device.field_type.clone(),
+            vm_path: device.vm_path.clone(),
+            container_path: device.container_path.clone(),
+            options: device.options.clone(),
+        }
+    }
+}
+
+impl ConsumedDeviceIdentity {
+    fn matches(&self, device: &agent::types::Device) -> bool {
+        self == &Self::from(device)
+    }
+
+    fn same_source(&self, device: &agent::types::Device) -> bool {
+        (self.field_type == device.field_type && self.id == device.id)
+            || (!self.vm_path.is_empty() && self.vm_path == device.vm_path)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ConsumedOciBlockIdentity {
+    path: PathBuf,
+    major: i64,
+    minor: i64,
+}
+
+impl ConsumedOciBlockIdentity {
+    fn matches(&self, device: &oci::LinuxDevice) -> bool {
+        device.typ() == oci::LinuxDeviceType::B
+            && device.path() == &self.path
+            && device.major() == self.major
+            && device.minor() == self.minor
+    }
+
+    fn same_device(&self, device: &oci::LinuxDevice) -> bool {
+        device.typ() == oci::LinuxDeviceType::B
+            && device.major() == self.major
+            && device.minor() == self.minor
+    }
+}
 
 /// Container-local result of consuming confidential raw block devices.
-#[derive(Default)]
+#[derive(Debug, Default)]
 pub(super) struct ConfidentialVolumePlan {
     pub(super) storages: Vec<Storage>,
     pub(super) mounts: Vec<oci::Mount>,
-    consumed_device_paths: BTreeSet<String>,
+    consumed_devices: Vec<ConsumedDeviceIdentity>,
+    consumed_oci_devices: Vec<ConsumedOciBlockIdentity>,
 }
 
 impl ConfidentialVolumePlan {
@@ -35,16 +91,28 @@ impl ConfidentialVolumePlan {
         spec: &mut oci::Spec,
         devices: Vec<ContainerDevice>,
     ) -> Result<Vec<ContainerDevice>> {
-        if self.consumed_device_paths.is_empty() {
+        if self.consumed_devices.is_empty() {
             return Ok(devices);
         }
 
+        for consumed in &self.consumed_devices {
+            let matches = devices
+                .iter()
+                .filter(|device| consumed.matches(&device.device))
+                .count();
+            if matches != 1 {
+                return Err(anyhow!(
+                    "confidential device identity must be consumed exactly once"
+                ));
+            }
+        }
         let remaining = devices
             .into_iter()
             .filter(|device| {
                 !self
-                    .consumed_device_paths
-                    .contains(&device.device.container_path)
+                    .consumed_devices
+                    .iter()
+                    .any(|consumed| consumed.matches(&device.device))
             })
             .collect();
 
@@ -53,21 +121,22 @@ impl ConfidentialVolumePlan {
             .as_mut()
             .context("OCI spec missing linux field")?;
         let mut linux_devices = linux.devices().clone().unwrap_or_default();
-        for path in &self.consumed_device_paths {
-            let matching_devices = linux_devices
+        for consumed in &self.consumed_oci_devices {
+            let matches = linux_devices
                 .iter()
-                .filter(|device| device.path().to_string_lossy() == *path)
-                .collect::<Vec<_>>();
-            if matching_devices.len() != 1 || matching_devices[0].typ() != oci::LinuxDeviceType::B {
+                .filter(|device| consumed.matches(device))
+                .count();
+            if matches != 1 {
                 return Err(anyhow!(
-                    "confidential device path {path:?} must identify exactly one OCI block device"
+                    "confidential OCI block identity must be consumed exactly once"
                 ));
             }
         }
         linux_devices.retain(|device| {
             !self
-                .consumed_device_paths
-                .contains(device.path().to_string_lossy().as_ref())
+                .consumed_oci_devices
+                .iter()
+                .any(|consumed| consumed.matches(device))
         });
         linux.set_devices((!linux_devices.is_empty()).then_some(linux_devices));
 
@@ -117,11 +186,61 @@ pub(super) fn build_confidential_volume_plan(
             ));
         }
         let device = &matching_devices[0].device;
-        if device.id.is_empty() || device.field_type.is_empty() {
+        if device.id.is_empty()
+            || !matches!(
+                device.field_type.as_str(),
+                DRIVER_BLK_PCI_TYPE | DRIVER_SCSI_TYPE
+            )
+            || device.vm_path.starts_with(CONFIDENTIAL_MAPPER_PREFIX)
+            || !device.options.is_empty()
+        {
             return Err(anyhow!(
-                "confidential volume {volume_name:?} resolved an incomplete guest block device"
+                "confidential volume {volume_name:?} resolved an invalid guest block device identity"
             ));
         }
+        let consumed_device = ConsumedDeviceIdentity::from(device);
+        if devices.iter().any(|candidate| {
+            candidate.device.container_path != device.container_path
+                && consumed_device.same_source(&candidate.device)
+        }) {
+            return Err(anyhow!(
+                "confidential volume {volume_name:?} block identity is aliased by another device request"
+            ));
+        }
+
+        let consumed_oci_device = {
+            let linux = spec
+                .linux()
+                .as_ref()
+                .context("OCI spec missing linux field")?;
+            let linux_devices = linux.devices().as_deref().unwrap_or(&[]);
+            let matching_oci_devices = linux_devices
+                .iter()
+                .filter(|candidate| {
+                    candidate.path().as_path() == Path::new(&declaration.device_path)
+                })
+                .collect::<Vec<_>>();
+            if matching_oci_devices.len() != 1
+                || matching_oci_devices[0].typ() != oci::LinuxDeviceType::B
+            {
+                return Err(anyhow!(
+                    "confidential volume {volume_name:?} must identify exactly one OCI block device"
+                ));
+            }
+            let identity = ConsumedOciBlockIdentity {
+                path: matching_oci_devices[0].path().clone(),
+                major: matching_oci_devices[0].major(),
+                minor: matching_oci_devices[0].minor(),
+            };
+            if linux_devices.iter().any(|candidate| {
+                candidate.path() != &identity.path && identity.same_device(candidate)
+            }) {
+                return Err(anyhow!(
+                    "confidential volume {volume_name:?} block identity is aliased by another OCI device"
+                ));
+            }
+            identity
+        };
         for destination in destinations {
             if existing_mounts
                 .iter()
@@ -172,7 +291,8 @@ pub(super) fn build_confidential_volume_plan(
             ]));
             plan.mounts.push(mount);
         }
-        plan.consumed_device_paths.insert(declaration.device_path);
+        plan.consumed_devices.push(consumed_device);
+        plan.consumed_oci_devices.push(consumed_oci_device);
     }
 
     Ok(plan)
@@ -372,5 +492,75 @@ mod tests {
         mount.set_destination(PathBuf::from("/workspace"));
         spec.set_mounts(Some(vec![mount]));
         assert!(build_confidential_volume_plan(&mut spec, &[raw_device()]).is_err());
+    }
+
+    #[test]
+    fn rejects_agent_source_identity_aliases() {
+        let mut spec = spec("workspace", Some(DECLARATION));
+        let confidential = raw_device();
+        let mut alias = ordinary_device();
+        alias.device.id.clone_from(&confidential.device.id);
+
+        let error = build_confidential_volume_plan(&mut spec, &[confidential, alias]).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("aliased by another device request"));
+    }
+
+    #[test]
+    fn rejects_oci_major_minor_aliases() {
+        let mut spec = spec("workspace", Some(DECLARATION));
+        spec.linux_mut()
+            .as_mut()
+            .unwrap()
+            .devices_mut()
+            .as_mut()
+            .unwrap()
+            .push(
+                LinuxDeviceBuilder::default()
+                    .path(PathBuf::from("/dev/ordinary"))
+                    .typ(LinuxDeviceType::B)
+                    .major(8_i64)
+                    .minor(1_i64)
+                    .build()
+                    .unwrap(),
+            );
+
+        let error = build_confidential_volume_plan(&mut spec, &[raw_device()]).unwrap_err();
+        assert!(error.to_string().contains("aliased by another OCI device"));
+    }
+
+    #[test]
+    fn consumes_only_the_bound_device_identities() {
+        let mut spec = spec("workspace", Some(DECLARATION));
+        let plan = build_confidential_volume_plan(&mut spec, &[raw_device()]).unwrap();
+        let mut substituted = raw_device();
+        substituted.device.id = "01/00".to_string();
+
+        let error = plan
+            .consume_devices(&mut spec, vec![substituted])
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("device identity must be consumed exactly once"));
+    }
+
+    #[test]
+    fn rejects_confidential_mapper_paths_and_non_block_oci_types() {
+        let mut mapper = raw_device();
+        mapper.device.vm_path = "/dev/mapper/coco-pv-existing".to_string();
+        let mut mapper_spec = spec("workspace", Some(DECLARATION));
+        assert!(build_confidential_volume_plan(&mut mapper_spec, &[mapper]).is_err());
+
+        let mut char_spec = spec("workspace", Some(DECLARATION));
+        char_spec
+            .linux_mut()
+            .as_mut()
+            .unwrap()
+            .devices_mut()
+            .as_mut()
+            .unwrap()[0]
+            .set_typ(LinuxDeviceType::C);
+        assert!(build_confidential_volume_plan(&mut char_spec, &[raw_device()]).is_err());
     }
 }
