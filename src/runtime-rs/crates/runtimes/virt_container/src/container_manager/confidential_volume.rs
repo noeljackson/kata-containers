@@ -12,13 +12,14 @@ use kata_types::annotations::KATA_ANNO_CONFIDENTIAL_VOLUME;
 use kata_types::confidential_volume::{
     confidential_storage_mount_name, parse_confidential_volume_declarations,
     ConfidentialFSGroupChangePolicy, KATA_CONFIDENTIAL_STORAGE_FS_TYPE,
+    KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT,
 };
+use kata_types::config::hypervisor::SharedFsInfo;
 use kata_types::device::{DRIVER_BLK_PCI_TYPE, DRIVER_SCSI_TYPE};
 use kata_types::k8s;
 use oci_spec::runtime as oci;
 use resource::cdi_devices::ContainerDevice;
 
-const CONFIDENTIAL_MOUNT_ROOT: &str = "/run/kata-containers/shared/containers/passthrough";
 const CONFIDENTIAL_MAPPER_PREFIX: &str = "/dev/mapper/coco-pv-";
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -148,6 +149,7 @@ impl ConfidentialVolumePlan {
 pub(super) fn build_confidential_volume_plan(
     spec: &mut oci::Spec,
     devices: &[ContainerDevice],
+    selected_shared_fs: Option<&SharedFsInfo>,
 ) -> Result<ConfidentialVolumePlan> {
     let annotations = spec.annotations().as_ref();
     let Some(raw) = annotations
@@ -156,6 +158,20 @@ pub(super) fn build_confidential_volume_plan(
     else {
         return Ok(ConfidentialVolumePlan::default());
     };
+    match selected_shared_fs {
+        Some(shared_fs) if shared_fs.shared_fs.is_none() => {}
+        Some(shared_fs) => {
+            return Err(anyhow!(
+                "confidential storage requires shared_fs=none; selected hypervisor uses {:?}",
+                shared_fs.shared_fs
+            ));
+        }
+        None => {
+            return Err(anyhow!(
+                "confidential storage requires an unambiguous selected hypervisor with shared_fs=none"
+            ));
+        }
+    }
     let declarations = parse_confidential_volume_declarations(&raw)
         .context("parse confidential volume annotation")?;
     spec.annotations_mut()
@@ -257,7 +273,7 @@ pub(super) fn build_confidential_volume_plan(
         }
 
         let mount_name = confidential_storage_mount_name(&declaration.manifest_uri)?;
-        let mount_point = format!("{CONFIDENTIAL_MOUNT_ROOT}/{mount_name}");
+        let mount_point = format!("{KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT}/{mount_name}");
         let fs_group = declaration.fs_group.map(|group_id| FSGroup {
             group_id,
             group_change_policy: match declaration.fs_group_change_policy {
@@ -388,10 +404,16 @@ mod tests {
         }
     }
 
+    fn disabled_shared_fs() -> SharedFsInfo {
+        SharedFsInfo::default()
+    }
+
     #[test]
     fn translates_and_consumes_raw_device() {
         let mut spec = spec("workspace", Some(DECLARATION));
-        let plan = build_confidential_volume_plan(&mut spec, &[raw_device()]).unwrap();
+        let plan =
+            build_confidential_volume_plan(&mut spec, &[raw_device()], Some(&disabled_shared_fs()))
+                .unwrap();
 
         assert_eq!(plan.storages.len(), 1);
         assert_eq!(plan.mounts.len(), 2);
@@ -425,7 +447,7 @@ mod tests {
     #[test]
     fn ordinary_devices_are_unchanged_without_opt_in() {
         let mut spec = spec("workspace", None);
-        let plan = build_confidential_volume_plan(&mut spec, &[raw_device()]).unwrap();
+        let plan = build_confidential_volume_plan(&mut spec, &[raw_device()], None).unwrap();
         let remaining = plan.consume_devices(&mut spec, vec![raw_device()]).unwrap();
         assert!(plan.storages.is_empty());
         assert_eq!(remaining.len(), 1);
@@ -442,10 +464,45 @@ mod tests {
     }
 
     #[test]
+    fn rejects_missing_or_enabled_shared_fs_before_building_storage() {
+        for shared_fs_name in ["virtio-fs", "inline-virtio-fs", "virtio-fs-nydus", "9p"] {
+            let mut spec = spec("workspace", Some(DECLARATION));
+            let shared_fs = SharedFsInfo {
+                shared_fs: Some(shared_fs_name.to_string()),
+                ..Default::default()
+            };
+            let error =
+                build_confidential_volume_plan(&mut spec, &[raw_device()], Some(&shared_fs))
+                    .unwrap_err();
+            assert!(error.to_string().contains("requires shared_fs=none"));
+            assert!(spec
+                .annotations()
+                .as_ref()
+                .unwrap()
+                .contains_key(KATA_ANNO_CONFIDENTIAL_VOLUME));
+        }
+
+        let mut spec = spec("workspace", Some(DECLARATION));
+        let error = build_confidential_volume_plan(&mut spec, &[raw_device()], None).unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("unambiguous selected hypervisor"));
+        assert!(spec
+            .annotations()
+            .as_ref()
+            .unwrap()
+            .contains_key(KATA_ANNO_CONFIDENTIAL_VOLUME));
+    }
+
+    #[test]
     fn consumes_only_the_declared_device_from_mixed_input() {
         let mut spec = spec("workspace", Some(DECLARATION));
-        let plan =
-            build_confidential_volume_plan(&mut spec, &[raw_device(), ordinary_device()]).unwrap();
+        let plan = build_confidential_volume_plan(
+            &mut spec,
+            &[raw_device(), ordinary_device()],
+            Some(&disabled_shared_fs()),
+        )
+        .unwrap();
         let remaining = plan
             .consume_devices(&mut spec, vec![raw_device(), ordinary_device()])
             .unwrap();
@@ -457,9 +514,15 @@ mod tests {
     fn shares_one_stable_guest_activation_across_declared_containers() {
         let mut workspace = spec("workspace", Some(SHARED_DECLARATION));
         let mut dind = spec("dind", Some(SHARED_DECLARATION));
-        let workspace_plan =
-            build_confidential_volume_plan(&mut workspace, &[raw_device()]).unwrap();
-        let dind_plan = build_confidential_volume_plan(&mut dind, &[raw_device()]).unwrap();
+        let workspace_plan = build_confidential_volume_plan(
+            &mut workspace,
+            &[raw_device()],
+            Some(&disabled_shared_fs()),
+        )
+        .unwrap();
+        let dind_plan =
+            build_confidential_volume_plan(&mut dind, &[raw_device()], Some(&disabled_shared_fs()))
+                .unwrap();
 
         assert_eq!(workspace_plan.storages.len(), 1);
         assert_eq!(dind_plan.storages.len(), 1);
@@ -474,15 +537,27 @@ mod tests {
     #[test]
     fn rejects_missing_duplicate_or_undeclared_device_use() {
         let mut workspace_spec = spec("workspace", Some(DECLARATION));
-        assert!(build_confidential_volume_plan(&mut workspace_spec, &[]).is_err());
+        assert!(build_confidential_volume_plan(
+            &mut workspace_spec,
+            &[],
+            Some(&disabled_shared_fs())
+        )
+        .is_err());
         let mut workspace_spec = spec("workspace", Some(DECLARATION));
-        assert!(
-            build_confidential_volume_plan(&mut workspace_spec, &[raw_device(), raw_device()])
-                .is_err()
-        );
+        assert!(build_confidential_volume_plan(
+            &mut workspace_spec,
+            &[raw_device(), raw_device()],
+            Some(&disabled_shared_fs())
+        )
+        .is_err());
 
         let mut spec = spec("other", Some(DECLARATION));
-        assert!(build_confidential_volume_plan(&mut spec, &[raw_device()]).is_err());
+        assert!(build_confidential_volume_plan(
+            &mut spec,
+            &[raw_device()],
+            Some(&disabled_shared_fs())
+        )
+        .is_err());
     }
 
     #[test]
@@ -491,7 +566,12 @@ mod tests {
         let mut mount = oci::Mount::default();
         mount.set_destination(PathBuf::from("/workspace"));
         spec.set_mounts(Some(vec![mount]));
-        assert!(build_confidential_volume_plan(&mut spec, &[raw_device()]).is_err());
+        assert!(build_confidential_volume_plan(
+            &mut spec,
+            &[raw_device()],
+            Some(&disabled_shared_fs())
+        )
+        .is_err());
     }
 
     #[test]
@@ -501,7 +581,12 @@ mod tests {
         let mut alias = ordinary_device();
         alias.device.id.clone_from(&confidential.device.id);
 
-        let error = build_confidential_volume_plan(&mut spec, &[confidential, alias]).unwrap_err();
+        let error = build_confidential_volume_plan(
+            &mut spec,
+            &[confidential, alias],
+            Some(&disabled_shared_fs()),
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("aliased by another device request"));
@@ -526,14 +611,18 @@ mod tests {
                     .unwrap(),
             );
 
-        let error = build_confidential_volume_plan(&mut spec, &[raw_device()]).unwrap_err();
+        let error =
+            build_confidential_volume_plan(&mut spec, &[raw_device()], Some(&disabled_shared_fs()))
+                .unwrap_err();
         assert!(error.to_string().contains("aliased by another OCI device"));
     }
 
     #[test]
     fn consumes_only_the_bound_device_identities() {
         let mut spec = spec("workspace", Some(DECLARATION));
-        let plan = build_confidential_volume_plan(&mut spec, &[raw_device()]).unwrap();
+        let plan =
+            build_confidential_volume_plan(&mut spec, &[raw_device()], Some(&disabled_shared_fs()))
+                .unwrap();
         let mut substituted = raw_device();
         substituted.device.id = "01/00".to_string();
 
@@ -550,7 +639,12 @@ mod tests {
         let mut mapper = raw_device();
         mapper.device.vm_path = "/dev/mapper/coco-pv-existing".to_string();
         let mut mapper_spec = spec("workspace", Some(DECLARATION));
-        assert!(build_confidential_volume_plan(&mut mapper_spec, &[mapper]).is_err());
+        assert!(build_confidential_volume_plan(
+            &mut mapper_spec,
+            &[mapper],
+            Some(&disabled_shared_fs())
+        )
+        .is_err());
 
         let mut char_spec = spec("workspace", Some(DECLARATION));
         char_spec
@@ -561,6 +655,11 @@ mod tests {
             .as_mut()
             .unwrap()[0]
             .set_typ(LinuxDeviceType::C);
-        assert!(build_confidential_volume_plan(&mut char_spec, &[raw_device()]).is_err());
+        assert!(build_confidential_volume_plan(
+            &mut char_spec,
+            &[raw_device()],
+            Some(&disabled_shared_fs())
+        )
+        .is_err());
     }
 }

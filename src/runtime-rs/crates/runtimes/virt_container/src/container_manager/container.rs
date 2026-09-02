@@ -209,8 +209,12 @@ impl Container {
             .resource_manager
             .handler_devices(&config.container_id, linux)
             .await?;
+        let selected_shared_fs = toml_config
+            .hypervisor
+            .get(&toml_config.runtime.hypervisor_name)
+            .map(|hypervisor| &hypervisor.shared_fs);
         let confidential_volume_plan =
-            build_confidential_volume_plan(&mut spec, &container_devices)
+            build_confidential_volume_plan(&mut spec, &container_devices, selected_shared_fs)
                 .context("build confidential raw-block volume plan")?;
         let container_devices = confidential_volume_plan
             .consume_devices(&mut spec, container_devices)

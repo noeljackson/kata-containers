@@ -24,6 +24,10 @@ const MOUNT_NAME_PREFIX: &str = "confidential-";
 /// Fail-closed filesystem discriminator for confidential storage.
 pub const KATA_CONFIDENTIAL_STORAGE_FS_TYPE: &str = "confidential-storage";
 
+/// Guest-only parent for plaintext confidential-storage mounts.
+pub const KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT: &str =
+    "/run/kata-containers/shared/containers/passthrough";
+
 /// Access requested for a confidential volume.
 #[derive(Debug, Clone, Copy, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
