@@ -10,7 +10,7 @@ use self::scsi_device_handler::ScsiDeviceHandler;
 use self::vfio_device_handler::{VfioApDeviceHandler, VfioPciDeviceHandler};
 use crate::pci;
 use crate::sandbox::PciHostGuestMapping;
-use crate::sandbox::Sandbox;
+use crate::sandbox::{BlockDeviceIdentity, ContainerDeviceExposure, Sandbox};
 use anyhow::{anyhow, Context, Result};
 use cdi::annotations::parse_annotations;
 use cdi::cache::{new_cache, with_auto_refresh, CdiOption};
@@ -43,7 +43,7 @@ pub mod vfio_device_handler;
 
 pub const BLOCK: &str = "block";
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 pub struct DeviceInfo {
     // Device type, "b" for block device and "c" for character device
     cgroup_type: String,
@@ -199,6 +199,7 @@ pub async fn add_devices(
             match handler.device_handler(device, &mut ctx).await {
                 Ok(update) => {
                     if let Some(dev_update) = update.dev {
+                        validate_resolved_device_request(device, &dev_update.info)?;
                         if dev_updates
                             .insert(&device.container_path, dev_update.clone())
                             .is_some()
@@ -263,7 +264,114 @@ pub async fn add_devices(
         expose_guest_infiniband_devices(logger, spec).context("expose_guest_infiniband_devices")?;
     }
 
-    update_spec_devices(logger, spec, dev_updates)
+    update_spec_devices(logger, spec, dev_updates)?;
+    refresh_container_device_exposure(cid, spec, sandbox).await
+}
+
+fn validate_resolved_device_request(device: &Device, resolved: &DeviceInfo) -> Result<()> {
+    if device.vm_path.is_empty() {
+        return Ok(());
+    }
+    let requested = DeviceInfo::new(&device.vm_path, true)
+        .with_context(|| format!("inspect requested VM device path {}", device.vm_path))?;
+    if requested != *resolved {
+        return Err(anyhow!(
+            "device VM path does not resolve to the handler-selected identity"
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn active_confidential_mapper_identities() -> Result<HashSet<BlockDeviceIdentity>> {
+    let mapper_directory = match fs::read_dir("/dev/mapper") {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(HashSet::new()),
+        Err(error) => return Err(error).context("inspect active device-mapper names"),
+    };
+    let mut identities = HashSet::new();
+    for entry in mapper_directory {
+        let entry = entry.context("read active device-mapper entry")?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with("coco-pv-") {
+            continue;
+        }
+        let metadata = fs::metadata(entry.path())
+            .with_context(|| format!("inspect confidential mapper {name}"))?;
+        if !metadata.file_type().is_block_device() {
+            return Err(anyhow!(
+                "confidential mapper name {name:?} does not resolve to a block device"
+            ));
+        }
+        let device = metadata.rdev();
+        identities.insert(BlockDeviceIdentity::new(
+            stat::major(device) as i64,
+            stat::minor(device) as i64,
+        )?);
+    }
+    Ok(identities)
+}
+
+fn container_device_exposure(spec: &Spec) -> Result<ContainerDeviceExposure> {
+    let mut exposure = ContainerDeviceExposure::default();
+    let Some(linux) = spec.linux().as_ref() else {
+        return Ok(exposure);
+    };
+
+    if let Some(devices) = linux.devices().as_ref() {
+        for device in devices {
+            match device.typ() {
+                oci::LinuxDeviceType::B => {
+                    exposure
+                        .block_devices
+                        .insert(BlockDeviceIdentity::new(device.major(), device.minor())?);
+                }
+                oci::LinuxDeviceType::A => exposure.allows_all_block_devices = true,
+                _ => {}
+            }
+        }
+    }
+
+    if let Some(devices) = linux
+        .resources()
+        .as_ref()
+        .and_then(|resources| resources.devices().as_ref())
+    {
+        for device in devices.iter().filter(|device| device.allow()) {
+            if matches!(
+                device.typ(),
+                Some(oci::LinuxDeviceType::C | oci::LinuxDeviceType::U | oci::LinuxDeviceType::P)
+            ) {
+                continue;
+            }
+            match (device.major(), device.minor()) {
+                (Some(major), Some(minor)) => {
+                    exposure
+                        .block_devices
+                        .insert(BlockDeviceIdentity::new(major, minor)?);
+                }
+                _ => exposure.allows_all_block_devices = true,
+            }
+        }
+    }
+    Ok(exposure)
+}
+
+pub(crate) async fn refresh_container_device_exposure(
+    cid: &str,
+    spec: &Spec,
+    sandbox: &Arc<Mutex<Sandbox>>,
+) -> Result<()> {
+    let admission = sandbox.lock().await.confidential_device_admission();
+    let _guard = admission.lock().await;
+    let active_mappers = active_confidential_mapper_identities()?;
+    let exposure = container_device_exposure(spec)?;
+    sandbox
+        .lock()
+        .await
+        .register_container_device_exposure(cid, exposure, &active_mappers)
 }
 
 /// Returns true if `devices` contains at least one entry whose
@@ -725,6 +833,13 @@ fn update_spec_devices(
         {
             let host_major = specdev.major();
             let host_minor = specdev.minor();
+
+            if devtype != update.info.cgroup_type {
+                return Err(anyhow!(
+                    "OCI device type for {} does not match resolved device type",
+                    specdev.path().display()
+                ));
+            }
 
             info!(
                 logger,
@@ -1308,6 +1423,100 @@ mod tests {
     }
 
     #[test]
+    fn resolved_vm_path_must_match_the_handler_identity() {
+        let mut device = Device::new();
+        device.vm_path = "/dev/null".to_string();
+
+        assert!(validate_resolved_device_request(
+            &device,
+            &DeviceInfo::new("/dev/null", true).unwrap(),
+        )
+        .is_ok());
+        assert!(validate_resolved_device_request(
+            &device,
+            &DeviceInfo::new("/dev/zero", true).unwrap(),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn container_exposure_tracks_block_nodes_cgroups_and_wildcards() {
+        let linux = LinuxBuilder::default()
+            .devices(vec![
+                LinuxDeviceBuilder::default()
+                    .path(PathBuf::from("/dev/block"))
+                    .typ(LinuxDeviceType::B)
+                    .major(8_i64)
+                    .minor(1_i64)
+                    .build()
+                    .unwrap(),
+                LinuxDeviceBuilder::default()
+                    .path(PathBuf::from("/dev/char"))
+                    .typ(LinuxDeviceType::C)
+                    .major(1_i64)
+                    .minor(3_i64)
+                    .build()
+                    .unwrap(),
+            ])
+            .resources(
+                LinuxResourcesBuilder::default()
+                    .devices(vec![
+                        LinuxDeviceCgroupBuilder::default()
+                            .allow(true)
+                            .typ(LinuxDeviceType::B)
+                            .major(8_i64)
+                            .minor(2_i64)
+                            .build()
+                            .unwrap(),
+                        LinuxDeviceCgroupBuilder::default()
+                            .allow(false)
+                            .typ(LinuxDeviceType::B)
+                            .major(8_i64)
+                            .minor(3_i64)
+                            .build()
+                            .unwrap(),
+                    ])
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let mut spec = SpecBuilder::default().linux(linux).build().unwrap();
+
+        let exposure = container_device_exposure(&spec).unwrap();
+        assert_eq!(
+            exposure.block_devices,
+            HashSet::from([
+                BlockDeviceIdentity::new(8, 1).unwrap(),
+                BlockDeviceIdentity::new(8, 2).unwrap(),
+            ])
+        );
+        assert!(!exposure.allows_all_block_devices);
+
+        spec.linux_mut()
+            .as_mut()
+            .unwrap()
+            .resources_mut()
+            .as_mut()
+            .unwrap()
+            .devices_mut()
+            .as_mut()
+            .unwrap()
+            .push(
+                LinuxDeviceCgroupBuilder::default()
+                    .allow(true)
+                    .typ(LinuxDeviceType::A)
+                    .build()
+                    .unwrap(),
+            );
+        assert!(
+            container_device_exposure(&spec)
+                .unwrap()
+                .allows_all_block_devices
+        );
+    }
+
+    #[test]
     fn test_spec_update_conversions() {
         let info = DeviceInfo::new("/dev/null", true).unwrap();
         let spec_update: SpecUpdate = info.into();
@@ -1459,6 +1668,7 @@ mod tests {
             .unwrap()
             .set_devices(Some(vec![LinuxDeviceBuilder::default()
                 .path(PathBuf::from("/dev/null2"))
+                .typ(LinuxDeviceType::C)
                 .major(TEST_MAJOR)
                 .minor(TEST_MINOR)
                 .build()
@@ -1500,6 +1710,7 @@ mod tests {
             .unwrap()
             .set_devices(Some(vec![LinuxDeviceBuilder::default()
                 .path(PathBuf::from(TEST_CONTAINER_PATH))
+                .typ(LinuxDeviceType::C)
                 .major(TEST_MAJOR)
                 .minor(TEST_MINOR)
                 .build()
@@ -1508,6 +1719,7 @@ mod tests {
         spec.linux_mut().as_mut().unwrap().set_resources(Some(
             oci::LinuxResourcesBuilder::default()
                 .devices(vec![LinuxDeviceCgroupBuilder::default()
+                    .typ(LinuxDeviceType::C)
                     .major(TEST_MAJOR)
                     .minor(TEST_MINOR)
                     .build()
@@ -1522,6 +1734,42 @@ mod tests {
             create_device_update(TEST_CONTAINER_PATH, TEST_VM_PATH),
         );
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn update_spec_devices_rejects_resolved_type_substitution() {
+        let logger = create_test_logger();
+        let null = fs::metadata("/dev/null").unwrap();
+        let mut spec = SpecBuilder::default()
+            .linux(
+                LinuxBuilder::default()
+                    .devices(vec![LinuxDeviceBuilder::default()
+                        .path(PathBuf::from("/dev/substituted"))
+                        .typ(LinuxDeviceType::B)
+                        .major(8_i64)
+                        .minor(1_i64)
+                        .build()
+                        .unwrap()])
+                    .build()
+                    .unwrap(),
+            )
+            .build()
+            .unwrap();
+        let update = DevUpdate {
+            info: DeviceInfo::new("/dev/null", true).unwrap(),
+            final_path: None,
+        };
+        assert_eq!(stat::major(null.rdev()) as i64, update.info.guest_major);
+
+        let error = update_spec_devices(
+            &logger,
+            &mut spec,
+            HashMap::from([("/dev/substituted", update)]),
+        )
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("does not match resolved device type"));
     }
 
     #[test]

@@ -76,7 +76,7 @@ use crate::device::network_device_handler::wait_for_ccw_net_interface;
 use crate::device::network_device_handler::wait_for_pci_net_interface;
 use crate::device::{
     add_devices, cdi_devices_from_visible_devices, dump_nvidia_cdi_yaml, handle_cdi_devices,
-    update_env_pci,
+    refresh_container_device_exposure, update_env_pci,
 };
 use crate::features::get_build_features;
 use crate::metrics::get_metrics;
@@ -260,6 +260,7 @@ impl AgentService {
 
         let cid = req.container_id.clone();
         let storages = req.storages.clone();
+        let devices = req.devices.clone();
         let shared_mounts = req.shared_mounts.clone();
 
         kata_sys_util::validate::verify_id(&cid)?;
@@ -291,38 +292,6 @@ impl AgentService {
         info!(sl(), "receive createcontainer, spec: {:?}", &oci);
         info!(sl(), "receive createcontainer, storages: {:?}", &storages);
 
-        // Some devices need some extra processing (the ones invoked with
-        // --device for instance), and that's what this call is doing. It
-        // updates the devices listed in the OCI spec, so that they actually
-        // match real devices inside the VM. This step is necessary since we
-        // cannot predict everything from the caller.
-        add_devices(&cid, &sl(), &req.devices, &mut oci, &self.sandbox).await?;
-
-        // In guest-kernel mode some devices need extra handling. Taking the
-        // GPU as an example the shim will inject CDI annotations that will
-        // be used by the kata-agent to do containerEdits according to the
-        // CDI spec coming from a registry that is created on the fly by UDEV
-        // or other entities for a specifc device.
-        // In Kata we only consider the directory "/var/run/cdi", "/etc" may be
-        // readonly
-        dump_nvidia_cdi_yaml(&sl())?;
-        // When enabled, translate the container's VISIBLE_CDI_DEVICES
-        // environment variable into CDI GPU device requests, so that a
-        // container can select which of the VM's GPUs it sees at runtime.
-        let visible_cdi_devices = if AGENT_CONFIG.visible_cdi_devices {
-            cdi_devices_from_visible_devices(&oci)?
-        } else {
-            Vec::new()
-        };
-        handle_cdi_devices(
-            &sl(),
-            &mut oci,
-            "/var/run/cdi",
-            AGENT_CONFIG.cdi_timeout,
-            &visible_cdi_devices,
-        )
-        .await?;
-
         // Handle trusted storage configuration before mounting any storage
         cdh_handler_trusted_storage(&mut oci)
             .await
@@ -343,6 +312,33 @@ impl AgentService {
             .insert(cid.clone(), m);
 
         let create_result: Result<()> = async {
+            // Resolve and admit container devices only after storage identities
+            // are registered. This makes confidential backing and plaintext
+            // mapper major/minor values authoritative before any ordinary OCI,
+            // cgroup, volumeDevice, or hot-plug request can expose them.
+            add_devices(&cid, &sl(), &devices, &mut oci, &self.sandbox).await?;
+
+            // In guest-kernel mode some devices need extra handling. Taking the
+            // GPU as an example the shim will inject CDI annotations that will
+            // be used by the kata-agent to do containerEdits according to the
+            // CDI spec coming from a registry that is created on the fly by UDEV
+            // or other entities for a specific device.
+            dump_nvidia_cdi_yaml(&sl())?;
+            let visible_cdi_devices = if AGENT_CONFIG.visible_cdi_devices {
+                cdi_devices_from_visible_devices(&oci)?
+            } else {
+                Vec::new()
+            };
+            handle_cdi_devices(
+                &sl(),
+                &mut oci,
+                "/var/run/cdi",
+                AGENT_CONFIG.cdi_timeout,
+                &visible_cdi_devices,
+            )
+            .await?;
+            refresh_container_device_exposure(&cid, &oci, &self.sandbox).await?;
+
             // Handle sealed secrets after storage is mounted.
             cdh_handler_sealed_secrets(&mut oci)
                 .await
@@ -2230,6 +2226,7 @@ async fn remove_container_resources(sandbox: &mut Sandbox, cid: &str) -> Result<
         for m in mounts.iter() {
             if sandbox.storages.contains_key(m)
                 || sandbox.confidential_storage_activations.contains_key(m)
+                || sandbox.ordinary_storage_devices.contains_key(m)
             {
                 cmounts.push(m.to_string());
             }
@@ -2254,6 +2251,7 @@ async fn remove_container_resources(sandbox: &mut Sandbox, cid: &str) -> Result<
     sandbox.containers.remove(cid);
     // Remove any host -> guest mappings for this container
     sandbox.pcimap.remove(cid);
+    sandbox.container_device_exposures.remove(cid);
     Ok(())
 }
 
@@ -3017,6 +3015,43 @@ mod tests {
 
         let sandbox = service.sandbox.lock().await;
         assert!(!sandbox.storages.contains_key(mount_point));
+        assert!(!sandbox.container_mounts.contains_key(cid));
+        assert!(!sandbox.pending_storage_cleanup.contains(cid));
+    }
+
+    #[tokio::test]
+    async fn remove_container_resumes_ordinary_identity_cleanup_without_storage_state() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let cid = "failed-ordinary-create";
+        let mount_point = "/run/kata-containers/nonexistent-failed-ordinary-storage-transaction";
+        sandbox
+            .register_ordinary_storage_device(
+                mount_point,
+                crate::sandbox::BlockDeviceIdentity::new(8, 1).unwrap(),
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+        sandbox
+            .container_mounts
+            .insert(cid.to_string(), vec![mount_point.to_string()]);
+        sandbox.pending_storage_cleanup.insert(cid.to_string());
+
+        let service = AgentService {
+            sandbox: Arc::new(Mutex::new(sandbox)),
+            init_mode: true,
+            oma: None,
+        };
+        service
+            .do_remove_container(protocols::agent::RemoveContainerRequest {
+                container_id: cid.to_string(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+
+        let sandbox = service.sandbox.lock().await;
+        assert!(!sandbox.ordinary_storage_devices.contains_key(mount_point));
         assert!(!sandbox.container_mounts.contains_key(cid));
         assert!(!sandbox.pending_storage_cleanup.contains(cid));
     }
