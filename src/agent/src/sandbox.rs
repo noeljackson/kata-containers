@@ -434,6 +434,10 @@ pub struct Sandbox {
     pub(crate) container_device_exposures: HashMap<String, ContainerDeviceExposure>,
     /// Serializes admission of ordinary and confidential block identities.
     confidential_device_admission: Arc<Mutex<()>>,
+    /// Set before the first confidential-storage transaction can await.
+    confidential_mount_isolation_required: bool,
+    /// Set before a request that can export the plaintext mount root can await.
+    host_shared_plaintext_root_requested: bool,
     pub uevent_map: HashMap<String, Uevent>,
     pub uevent_watchers: Vec<Option<UeventWatcher>>,
     pub shared_utsns: Namespace,
@@ -476,6 +480,8 @@ impl Sandbox {
             ordinary_storage_devices: HashMap::new(),
             container_device_exposures: HashMap::new(),
             confidential_device_admission: Arc::new(Mutex::new(())),
+            confidential_mount_isolation_required: false,
+            host_shared_plaintext_root_requested: false,
             uevent_map: HashMap::new(),
             uevent_watchers: Vec::new(),
             shared_utsns: Namespace::new(&logger),
@@ -712,6 +718,21 @@ impl Sandbox {
 
     pub(crate) fn confidential_device_admission(&self) -> Arc<Mutex<()>> {
         self.confidential_device_admission.clone()
+    }
+
+    pub(crate) fn admit_confidential_mount_topology(
+        &mut self,
+        requests_confidential_storage: bool,
+        requests_host_shared_plaintext_root: bool,
+    ) -> Result<()> {
+        self.confidential_mount_isolation_required |= requests_confidential_storage;
+        self.host_shared_plaintext_root_requested |= requests_host_shared_plaintext_root;
+        if self.confidential_mount_isolation_required && self.host_shared_plaintext_root_requested {
+            return Err(anyhow!(
+                "confidential storage cannot coexist with a host-shared plaintext mount root"
+            ));
+        }
+        Ok(())
     }
 
     fn protected_block_devices(&self) -> HashSet<BlockDeviceIdentity> {
