@@ -35,7 +35,7 @@ use slog::Logger;
 use thiserror::Error;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::oneshot;
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tracing::instrument;
 
 use crate::linux_abi::*;
@@ -44,6 +44,7 @@ use crate::namespace::Namespace;
 use crate::netlink::Handle;
 use crate::network::Network;
 use crate::pci;
+#[cfg(test)]
 use crate::storage::StorageDeviceGeneric;
 use crate::uevent::{Uevent, UeventMatcher};
 use crate::watcher::BindWatcher;
@@ -61,10 +62,40 @@ pub enum SandboxError {
 
 type UeventWatcher = (Box<dyn UeventMatcher>, oneshot::Sender<Uevent>);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageLifecyclePhase {
+    Initializing,
+    Ready,
+    Cleaning,
+    Failed,
+    Recoverable,
+    Removed,
+}
+
+#[derive(Clone)]
+enum StorageLifecycle {
+    Initializing {
+        cleanup: Option<Arc<dyn StorageDevice>>,
+    },
+    Ready(Arc<dyn StorageDevice>),
+    Cleaning {
+        _device: Option<Arc<dyn StorageDevice>>,
+    },
+    Failed {
+        error: Arc<str>,
+        cleanup: Option<Arc<dyn StorageDevice>>,
+    },
+    Recoverable {
+        error: Arc<str>,
+        device: Arc<dyn StorageDevice>,
+    },
+    Removed,
+}
+
 #[derive(Clone)]
 pub struct StorageState {
     count: Arc<AtomicU32>,
-    device: Arc<dyn StorageDevice>,
+    lifecycle: watch::Sender<StorageLifecycle>,
 
     /// Whether the storage is shared across multiple containers (e.g.
     /// block-based emptyDirs). Shared storages should not be cleaned up
@@ -75,37 +106,266 @@ pub struct StorageState {
 
 impl Debug for StorageState {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("StorageState").finish()
+        f.debug_struct("StorageState")
+            .field("phase", &self.phase())
+            .field("ref_count", &self.count.load(Ordering::Acquire))
+            .field("shared", &self.shared)
+            .finish()
     }
 }
 
 impl StorageState {
     fn new(shared: bool) -> Self {
+        let (lifecycle, _) = watch::channel(StorageLifecycle::Initializing { cleanup: None });
         StorageState {
             count: Arc::new(AtomicU32::new(1)),
-            device: Arc::new(StorageDeviceGeneric::default()),
+            lifecycle,
             shared,
         }
     }
 
-    pub fn path(&self) -> Option<&str> {
-        self.device.path()
+    pub(crate) fn phase(&self) -> StorageLifecyclePhase {
+        match &*self.lifecycle.borrow() {
+            StorageLifecycle::Initializing { .. } => StorageLifecyclePhase::Initializing,
+            StorageLifecycle::Ready(_) => StorageLifecyclePhase::Ready,
+            StorageLifecycle::Cleaning { .. } => StorageLifecyclePhase::Cleaning,
+            StorageLifecycle::Failed { .. } => StorageLifecyclePhase::Failed,
+            StorageLifecycle::Recoverable { .. } => StorageLifecyclePhase::Recoverable,
+            StorageLifecycle::Removed => StorageLifecyclePhase::Removed,
+        }
     }
 
     pub fn is_shared(&self) -> bool {
         self.shared
     }
 
+    #[cfg(test)]
     pub async fn ref_count(&self) -> u32 {
-        self.count.load(Ordering::Relaxed)
+        self.count.load(Ordering::Acquire)
     }
 
-    async fn inc_ref_count(&self) {
-        self.count.fetch_add(1, Ordering::Acquire);
+    fn inc_ref_count(&self) -> Result<()> {
+        self.count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_add(1)
+            })
+            .map(|_| ())
+            .map_err(|_| anyhow!("sandbox storage reference count overflow"))
     }
 
-    async fn dec_and_test_ref_count(&self) -> bool {
-        self.count.fetch_sub(1, Ordering::AcqRel) == 1
+    fn dec_ref_count(&self) -> Result<u32> {
+        self.count
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                count.checked_sub(1)
+            })
+            .map(|previous| previous - 1)
+            .map_err(|_| anyhow!("sandbox storage reference count is already zero"))
+    }
+
+    fn complete_initialization(
+        &self,
+        device: Arc<dyn StorageDevice>,
+    ) -> std::result::Result<(), Arc<dyn StorageDevice>> {
+        if self.phase() != StorageLifecyclePhase::Initializing {
+            return Err(device);
+        }
+        self.lifecycle.send_replace(StorageLifecycle::Ready(device));
+        Ok(())
+    }
+
+    pub(crate) fn fail_initialization(&self, error: &anyhow::Error) {
+        let cleanup = match self.lifecycle.borrow().clone() {
+            StorageLifecycle::Initializing { cleanup } => cleanup,
+            _ => return,
+        };
+        self.lifecycle.send_replace(StorageLifecycle::Failed {
+            error: format!("{error:#}").into(),
+            cleanup,
+        });
+    }
+
+    fn fail_initialization_with_device(
+        &self,
+        error: impl Into<Arc<str>>,
+        device: Arc<dyn StorageDevice>,
+    ) -> std::result::Result<(), Arc<dyn StorageDevice>> {
+        if self.phase() != StorageLifecyclePhase::Initializing {
+            return Err(device);
+        }
+        self.lifecycle.send_replace(StorageLifecycle::Recoverable {
+            error: error.into(),
+            device,
+        });
+        Ok(())
+    }
+
+    fn retain_initialization_cleanup_device(
+        &self,
+        device: Arc<dyn StorageDevice>,
+    ) -> std::result::Result<(), Arc<dyn StorageDevice>> {
+        let can_retain = matches!(
+            &*self.lifecycle.borrow(),
+            StorageLifecycle::Initializing { cleanup: None }
+        );
+        if !can_retain {
+            return Err(device);
+        }
+        self.lifecycle.send_replace(StorageLifecycle::Initializing {
+            cleanup: Some(device),
+        });
+        Ok(())
+    }
+
+    async fn wait_until_ready(&self) -> Result<Arc<dyn StorageDevice>> {
+        let mut lifecycle = self.lifecycle.subscribe();
+        loop {
+            let current = lifecycle.borrow().clone();
+            match current {
+                StorageLifecycle::Initializing { .. } => {}
+                StorageLifecycle::Ready(device) => return Ok(device),
+                StorageLifecycle::Cleaning { .. } => {
+                    return Err(anyhow!("sandbox storage is being cleaned"));
+                }
+                StorageLifecycle::Failed { error, .. } => {
+                    return Err(anyhow!(error.to_string()));
+                }
+                StorageLifecycle::Recoverable { error, .. } => {
+                    return Err(anyhow!(error.to_string()));
+                }
+                StorageLifecycle::Removed => {
+                    return Err(anyhow!("sandbox storage was removed before becoming ready"));
+                }
+            }
+            lifecycle
+                .changed()
+                .await
+                .map_err(|_| anyhow!("sandbox storage lifecycle owner disappeared"))?;
+        }
+    }
+
+    fn begin_cleanup(&self) -> Result<Option<Arc<dyn StorageDevice>>> {
+        let device = match self.lifecycle.borrow().clone() {
+            StorageLifecycle::Ready(device) => Some(device),
+            StorageLifecycle::Failed { cleanup, .. } => cleanup,
+            StorageLifecycle::Recoverable { device, .. } => Some(device),
+            StorageLifecycle::Initializing { .. } => {
+                return Err(anyhow!("sandbox storage is still initializing"));
+            }
+            StorageLifecycle::Cleaning { .. } => {
+                return Err(anyhow!("sandbox storage cleanup is already in progress"));
+            }
+            StorageLifecycle::Removed => return Err(anyhow!("sandbox storage is already removed")),
+        };
+        self.lifecycle.send_replace(StorageLifecycle::Cleaning {
+            _device: device.clone(),
+        });
+        Ok(device)
+    }
+
+    fn fail_cleanup(&self, error: &anyhow::Error, device: Arc<dyn StorageDevice>) {
+        self.lifecycle.send_replace(StorageLifecycle::Recoverable {
+            error: format!("{error:#}").into(),
+            device,
+        });
+    }
+
+    fn retain_recovery_device(&self, error: impl Into<Arc<str>>, device: Arc<dyn StorageDevice>) {
+        self.lifecycle.send_replace(StorageLifecycle::Recoverable {
+            error: error.into(),
+            device,
+        });
+    }
+
+    fn finish_cleanup(&self) {
+        self.lifecycle.send_replace(StorageLifecycle::Removed);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct StorageClaim {
+    state: StorageState,
+    initializer: bool,
+}
+
+impl StorageClaim {
+    pub(crate) fn is_initializer(&self) -> bool {
+        self.initializer
+    }
+
+    pub(crate) async fn wait_until_ready(&self) -> Result<Arc<dyn StorageDevice>> {
+        self.state.wait_until_ready().await
+    }
+
+    pub(crate) fn fail_initialization(&self, error: &anyhow::Error) {
+        if self.initializer {
+            self.state.fail_initialization(error);
+        }
+    }
+
+    pub(crate) fn fail_initialization_with_device(
+        &self,
+        error: impl Into<Arc<str>>,
+        device: Arc<dyn StorageDevice>,
+    ) -> std::result::Result<(), Arc<dyn StorageDevice>> {
+        if self.initializer {
+            self.state.fail_initialization_with_device(error, device)
+        } else {
+            Err(device)
+        }
+    }
+
+    pub(crate) fn retain_initialization_cleanup_device(
+        &self,
+        device: Arc<dyn StorageDevice>,
+    ) -> std::result::Result<(), Arc<dyn StorageDevice>> {
+        if self.initializer {
+            self.state.retain_initialization_cleanup_device(device)
+        } else {
+            Err(device)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn phase(&self) -> StorageLifecyclePhase {
+        self.state.phase()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn ref_count(&self) -> u32 {
+        self.state.ref_count().await
+    }
+}
+
+impl Drop for StorageClaim {
+    fn drop(&mut self) {
+        if self.initializer && self.state.phase() == StorageLifecyclePhase::Initializing {
+            self.state.fail_initialization(&anyhow!(
+                "sandbox storage initializer was dropped before completion"
+            ));
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StorageReferenceProgress {
+    ReferenceHeld,
+    StorageReleased,
+    ConfidentialDeactivated,
+    Complete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StorageReference {
+    pub(crate) mount_point: String,
+    pub(crate) progress: StorageReferenceProgress,
+}
+
+impl StorageReference {
+    pub(crate) fn new(mount_point: String) -> Self {
+        Self {
+            mount_point,
+            progress: StorageReferenceProgress::ReferenceHeld,
+        }
     }
 }
 
@@ -138,9 +398,9 @@ impl BlockDeviceIdentity {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ConfidentialStorageActivation {
-    pub(crate) activation_id: String,
+    pub(crate) activation_id: Option<String>,
     pub(crate) backing_device: BlockDeviceIdentity,
-    pub(crate) mapper_device: BlockDeviceIdentity,
+    pub(crate) mapper_device: Option<BlockDeviceIdentity>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -158,6 +418,10 @@ pub struct Sandbox {
     pub network: Network,
     pub mounts: Vec<String>,
     pub container_mounts: HashMap<String, Vec<String>>,
+    /// Per-container storage references and their last completed cleanup step.
+    pub(crate) container_storage_references: HashMap<String, Vec<StorageReference>>,
+    /// Sandbox-scoped storage references and their last completed cleanup step.
+    pub(crate) sandbox_storage_references: Vec<StorageReference>,
     /// Container IDs whose create transaction failed before storage cleanup completed.
     pub pending_storage_cleanup: HashSet<String>,
     /// dm-verity devices per container for cleanup
@@ -204,6 +468,8 @@ impl Sandbox {
             containers: HashMap::new(),
             mounts: Vec::new(),
             container_mounts: HashMap::new(),
+            container_storage_references: HashMap::new(),
+            sandbox_storage_references: Vec::new(),
             pending_storage_cleanup: HashSet::new(),
             container_verity_devices: HashMap::new(),
             confidential_storage_activations: HashMap::new(),
@@ -229,22 +495,44 @@ impl Sandbox {
         })
     }
 
-    /// Add a new storage object or increase reference count of existing one.
-    /// The caller may detect new storage object by checking `StorageState.refcount == 1`.
+    /// Claim one storage reference and elect exactly one initializer.
+    ///
+    /// Later callers can claim an initializing storage, but they must wait on
+    /// [`StorageClaim::wait_until_ready`] before using it. Failed, cleaning, or
+    /// recoverable state is never treated as reusable storage.
     /// The `shared` flag indicates if this storage is shared across multiple containers;
     /// if true, cleanup will be skipped when containers exit.
     #[instrument]
-    pub async fn add_sandbox_storage(&mut self, path: &str, shared: bool) -> StorageState {
+    pub(crate) fn add_sandbox_storage(&mut self, path: &str, shared: bool) -> Result<StorageClaim> {
         match self.storages.entry(path.to_string()) {
             Entry::Occupied(e) => {
                 let state = e.get().clone();
-                state.inc_ref_count().await;
-                state
+                if state.is_shared() != shared {
+                    return Err(anyhow!(
+                        "sandbox storage {path} changed its shared-storage contract"
+                    ));
+                }
+                match state.phase() {
+                    StorageLifecyclePhase::Initializing | StorageLifecyclePhase::Ready => {}
+                    phase => {
+                        return Err(anyhow!(
+                            "sandbox storage {path} is not reusable in {phase:?} state"
+                        ));
+                    }
+                }
+                state.inc_ref_count()?;
+                Ok(StorageClaim {
+                    state,
+                    initializer: false,
+                })
             }
             Entry::Vacant(e) => {
                 let state = StorageState::new(shared);
                 e.insert(state.clone());
-                state
+                Ok(StorageClaim {
+                    state,
+                    initializer: true,
+                })
             }
         }
     }
@@ -254,19 +542,126 @@ impl Sandbox {
     pub fn update_sandbox_storage(
         &mut self,
         path: &str,
+        claim: &StorageClaim,
         device: Arc<dyn StorageDevice>,
-    ) -> std::result::Result<Arc<dyn StorageDevice>, Arc<dyn StorageDevice>> {
+    ) -> std::result::Result<(), Arc<dyn StorageDevice>> {
         match self.storages.get(path) {
             None => Err(device),
-            Some(existing) => {
-                let state = StorageState {
-                    device,
-                    ..existing.clone()
-                };
-                // Safe to unwrap() because we have just ensured existence of entry via get().
-                let state = self.storages.insert(path.to_string(), state).unwrap();
-                Ok(state.device)
+            Some(existing)
+                if claim.initializer && Arc::ptr_eq(&existing.count, &claim.state.count) =>
+            {
+                existing.complete_initialization(device)
             }
+            Some(_) => Err(device),
+        }
+    }
+
+    pub(crate) fn retain_failed_storage_device(
+        &mut self,
+        path: &str,
+        error: impl Into<Arc<str>>,
+        device: Arc<dyn StorageDevice>,
+    ) {
+        let state = self
+            .storages
+            .entry(path.to_string())
+            .or_insert_with(|| StorageState::new(false));
+        state.retain_recovery_device(error, device);
+    }
+
+    pub(crate) fn begin_storage_transaction(&mut self, cid: Option<&str>) -> Result<()> {
+        if let Some(cid) = cid {
+            match self.container_storage_references.entry(cid.to_string()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(Vec::new());
+                    Ok(())
+                }
+                Entry::Occupied(_) => Err(anyhow!(
+                    "container {cid} already has a storage reference transaction"
+                )),
+            }
+        } else if self.sandbox_storage_references.is_empty() {
+            Ok(())
+        } else {
+            Err(anyhow!(
+                "sandbox already has a storage reference transaction"
+            ))
+        }
+    }
+
+    pub(crate) fn claim_storage_reference(
+        &mut self,
+        cid: Option<&str>,
+        mount_point: String,
+        shared: bool,
+    ) -> Result<StorageClaim> {
+        let reference = StorageReference::new(mount_point.clone());
+        if let Some(cid) = cid {
+            self.container_storage_references
+                .get_mut(cid)
+                .ok_or_else(|| anyhow!("container {cid} storage transaction is not registered"))?
+                .push(reference);
+        } else {
+            self.sandbox_storage_references.push(reference);
+        }
+
+        match self.add_sandbox_storage(&mount_point, shared) {
+            Ok(claim) => Ok(claim),
+            Err(error) => {
+                if let Some(cid) = cid {
+                    self.container_storage_references
+                        .get_mut(cid)
+                        .and_then(Vec::pop);
+                } else {
+                    self.sandbox_storage_references.pop();
+                }
+                Err(error)
+            }
+        }
+    }
+
+    pub(crate) fn take_storage_references(&mut self, cid: Option<&str>) -> Vec<StorageReference> {
+        match cid {
+            Some(cid) => self
+                .container_storage_references
+                .remove(cid)
+                .unwrap_or_default(),
+            None => std::mem::take(&mut self.sandbox_storage_references),
+        }
+    }
+
+    pub(crate) fn restore_storage_references(
+        &mut self,
+        cid: Option<&str>,
+        references: Vec<StorageReference>,
+    ) -> Result<()> {
+        if let Some(cid) = cid {
+            match self.container_storage_references.entry(cid.to_string()) {
+                Entry::Vacant(entry) => {
+                    entry.insert(references);
+                    Ok(())
+                }
+                Entry::Occupied(mut entry) => {
+                    // This should be unreachable while the sandbox lock is held, but
+                    // preserve both owners if a future caller changes that contract.
+                    let mut restored = references;
+                    restored.append(entry.get_mut());
+                    entry.insert(restored);
+                    Err(anyhow!(
+                        "container {cid} storage cleanup ledger changed during cleanup"
+                    ))
+                }
+            }
+        } else if self.sandbox_storage_references.is_empty() {
+            self.sandbox_storage_references = references;
+            Ok(())
+        } else {
+            let mut restored = references;
+            restored.append(&mut self.sandbox_storage_references);
+            self.sandbox_storage_references = restored;
+            Err(anyhow!(
+                "sandbox storage cleanup ledger changed during cleanup"
+            ))
         }
     }
 
@@ -280,25 +675,37 @@ impl Sandbox {
     /// removed.
     #[instrument]
     pub async fn remove_sandbox_storage(&mut self, path: &str) -> Result<bool> {
-        match self.storages.get(path) {
+        match self.storages.get(path).cloned() {
             None => Err(anyhow!("Sandbox storage with path {} not found", path)),
             Some(state) => {
-                if state.dec_and_test_ref_count().await {
-                    if state.is_shared() {
-                        state.count.store(1, Ordering::Release);
-                        return Ok(false);
-                    }
-                    if let Err(error) = state.device.cleanup() {
-                        // The final reference still owns a live device when cleanup fails. Keep
-                        // both so normal container or sandbox cleanup can retry in order.
+                let remaining = state.dec_ref_count()?;
+                if remaining > 0 {
+                    return Ok(false);
+                }
+                if state.is_shared() {
+                    state.count.store(1, Ordering::Release);
+                    return Ok(false);
+                }
+
+                let device = match state.begin_cleanup() {
+                    Ok(device) => device,
+                    Err(error) => {
                         state.count.store(1, Ordering::Release);
                         return Err(error);
                     }
-                    self.storages.remove(path);
-                    Ok(true)
-                } else {
-                    Ok(false)
+                };
+                if let Some(device) = device {
+                    if let Err(error) = device.cleanup() {
+                        // The final reference still owns a live device when cleanup fails. Keep
+                        // both so normal container or sandbox cleanup can retry in order.
+                        state.fail_cleanup(&error, device);
+                        state.count.store(1, Ordering::Release);
+                        return Err(error);
+                    }
                 }
+                state.finish_cleanup();
+                self.storages.remove(path);
+                Ok(true)
             }
         }
     }
@@ -310,7 +717,10 @@ impl Sandbox {
     fn protected_block_devices(&self) -> HashSet<BlockDeviceIdentity> {
         self.confidential_storage_activations
             .values()
-            .flat_map(|activation| [activation.backing_device, activation.mapper_device])
+            .flat_map(|activation| {
+                std::iter::once(activation.backing_device)
+                    .chain(activation.mapper_device.iter().copied())
+            })
             .collect()
     }
 
@@ -386,15 +796,115 @@ impl Sandbox {
         Ok(())
     }
 
-    pub(crate) fn ensure_confidential_backing_available(
-        &self,
+    /// Reserve ownership before asking CDH to activate a confidential volume.
+    ///
+    /// The backing identity remains protected even if a later activation-ID,
+    /// mapper, mount, or fsGroup check fails.
+    pub(crate) fn reserve_confidential_storage_activation(
+        &mut self,
+        path: &str,
         backing_device: BlockDeviceIdentity,
         active_mappers: &HashSet<BlockDeviceIdentity>,
     ) -> Result<()> {
-        self.ensure_confidential_device_available(backing_device, active_mappers, None)
+        self.ensure_confidential_device_available(backing_device, active_mappers, None)?;
+        match self
+            .confidential_storage_activations
+            .entry(path.to_string())
+        {
+            Entry::Vacant(entry) => {
+                entry.insert(ConfidentialStorageActivation {
+                    activation_id: None,
+                    backing_device,
+                    mapper_device: None,
+                });
+                Ok(())
+            }
+            Entry::Occupied(_) => Err(anyhow!(
+                "confidential storage activation already exists for path {path}"
+            )),
+        }
     }
 
-    /// Associate one CDH activation with both confidential block identities.
+    #[cfg(test)]
+    pub(crate) fn cancel_confidential_storage_reservation(&mut self, path: &str) -> Result<()> {
+        let activation = self
+            .confidential_storage_activations
+            .get(path)
+            .ok_or_else(|| anyhow!("confidential storage activation is not reserved"))?;
+        if activation.activation_id.is_some() || activation.mapper_device.is_some() {
+            return Err(anyhow!(
+                "cannot cancel a confidential storage reservation after activation"
+            ));
+        }
+        self.confidential_storage_activations.remove(path);
+        Ok(())
+    }
+
+    /// Record the opaque CDH handle before validating any returned metadata.
+    pub(crate) fn record_confidential_storage_activation_id(
+        &mut self,
+        path: &str,
+        activation_id: String,
+    ) -> Result<()> {
+        let activation = self
+            .confidential_storage_activations
+            .get_mut(path)
+            .ok_or_else(|| anyhow!("confidential storage activation is not reserved"))?;
+        if activation.activation_id.is_some() {
+            return Err(anyhow!(
+                "confidential storage activation ID is already recorded"
+            ));
+        }
+        activation.activation_id = Some(activation_id);
+        Ok(())
+    }
+
+    /// Bind the validated mapper identity to its pre-existing activation owner.
+    pub(crate) fn bind_confidential_storage_mapper(
+        &mut self,
+        path: &str,
+        activation_id: &str,
+        mapper_device: BlockDeviceIdentity,
+        active_mappers: &HashSet<BlockDeviceIdentity>,
+    ) -> Result<()> {
+        let activation = self
+            .confidential_storage_activations
+            .get(path)
+            .ok_or_else(|| anyhow!("confidential storage activation is not reserved"))?;
+        if activation.activation_id.as_deref() != Some(activation_id) {
+            return Err(anyhow!(
+                "confidential storage activation ID does not match registered owner"
+            ));
+        }
+        if activation.mapper_device.is_some() {
+            return Err(anyhow!(
+                "confidential storage mapper identity is already recorded"
+            ));
+        }
+        if activation.backing_device == mapper_device {
+            return Err(anyhow!(
+                "confidential backing and mapper block identities must differ"
+            ));
+        }
+        if !active_mappers.contains(&mapper_device) {
+            return Err(anyhow!(
+                "confidential mapper block identity is not active under the protected namespace"
+            ));
+        }
+        self.ensure_confidential_device_available(
+            mapper_device,
+            active_mappers,
+            Some(mapper_device),
+        )?;
+        self.confidential_storage_activations
+            .get_mut(path)
+            .ok_or_else(|| anyhow!("confidential storage activation owner disappeared"))?
+            .mapper_device = Some(mapper_device);
+        Ok(())
+    }
+
+    /// Convenience helper for callers that already validated the complete activation.
+    #[cfg(test)]
     pub(crate) fn register_confidential_storage_activation(
         &mut self,
         path: &str,
@@ -416,29 +926,22 @@ impl Sandbox {
                 "confidential mapper block identity is not active under the protected namespace"
             ));
         }
-        self.ensure_confidential_device_available(backing_device, active_mappers, None)?;
-        self.ensure_confidential_device_available(
-            mapper_device,
-            active_mappers,
-            Some(mapper_device),
-        )?;
-        match self
-            .confidential_storage_activations
-            .entry(path.to_string())
-        {
-            std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(ConfidentialStorageActivation {
-                    activation_id,
-                    backing_device,
+        self.reserve_confidential_storage_activation(path, backing_device, active_mappers)?;
+        if let Err(error) = self
+            .record_confidential_storage_activation_id(path, activation_id.clone())
+            .and_then(|_| {
+                self.bind_confidential_storage_mapper(
+                    path,
+                    &activation_id,
                     mapper_device,
-                });
-                Ok(())
-            }
-            std::collections::hash_map::Entry::Occupied(_) => Err(anyhow!(
-                "confidential storage activation already exists for path {}",
-                path
-            )),
+                    active_mappers,
+                )
+            })
+        {
+            self.confidential_storage_activations.remove(path);
+            return Err(error);
         }
+        Ok(())
     }
 
     pub(crate) fn remove_confidential_storage_activation(
@@ -450,7 +953,7 @@ impl Sandbox {
             .confidential_storage_activations
             .get(path)
             .ok_or_else(|| anyhow!("confidential storage activation is not registered"))?;
-        if activation.activation_id != activation_id {
+        if activation.activation_id.as_deref() != Some(activation_id) {
             return Err(anyhow!(
                 "confidential storage activation ID does not match registered owner"
             ));
@@ -981,6 +1484,17 @@ mod tests {
         baremount(src_path, dst_path, "bind", MsFlags::MS_BIND, "", logger)
     }
 
+    fn add_ready_storage(
+        sandbox: &mut Sandbox,
+        path: &str,
+        device: Arc<dyn StorageDevice>,
+    ) -> StorageClaim {
+        let claim = sandbox.add_sandbox_storage(path, false).unwrap();
+        assert!(claim.is_initializer());
+        assert!(sandbox.update_sandbox_storage(path, &claim, device).is_ok());
+        claim
+    }
+
     use serial_test::serial;
 
     #[tokio::test]
@@ -993,7 +1507,11 @@ mod tests {
         let tmpdir_path = tmpdir.path().to_str().unwrap();
 
         // Add a new sandbox storage
-        let new_storage = s.add_sandbox_storage(tmpdir_path, false).await;
+        let new_storage = add_ready_storage(
+            &mut s,
+            tmpdir_path,
+            Arc::new(StorageDeviceGeneric::default()),
+        );
 
         // Check the reference counter
         let ref_count = new_storage.ref_count().await;
@@ -1003,7 +1521,8 @@ mod tests {
         );
 
         // Use the existing sandbox storage
-        let new_storage = s.add_sandbox_storage(tmpdir_path, false).await;
+        let new_storage = s.add_sandbox_storage(tmpdir_path, false).unwrap();
+        assert!(!new_storage.is_initializer());
 
         // Since we are using existing storage, the reference counter
         // should be 2 by now.
@@ -1012,6 +1531,149 @@ mod tests {
             ref_count, 2,
             "Invalid refcount, got {ref_count} expected 2."
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_storage_claim_waits_for_the_single_initializer() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let path = "/run/kata-containers/storage-initialization-race";
+
+        sandbox
+            .begin_storage_transaction(Some("initializer"))
+            .unwrap();
+        sandbox.begin_storage_transaction(Some("waiter")).unwrap();
+        let initializer = sandbox
+            .claim_storage_reference(Some("initializer"), path.to_string(), false)
+            .unwrap();
+        let waiter = sandbox
+            .claim_storage_reference(Some("waiter"), path.to_string(), false)
+            .unwrap();
+        assert!(initializer.is_initializer());
+        assert!(!waiter.is_initializer());
+        assert_eq!(initializer.phase(), StorageLifecyclePhase::Initializing);
+        assert_eq!(sandbox.container_storage_references["initializer"].len(), 1);
+        assert_eq!(sandbox.container_storage_references["waiter"].len(), 1);
+        assert!(sandbox
+            .update_sandbox_storage(
+                path,
+                &waiter,
+                Arc::new(StorageDeviceGeneric::new("/wrong-owner".to_string())),
+            )
+            .is_err());
+        waiter.fail_initialization(&anyhow!("non-owner failure"));
+        assert_eq!(initializer.phase(), StorageLifecyclePhase::Initializing);
+
+        let (started_tx, started_rx) = oneshot::channel();
+        let waiter_task = tokio::spawn(async move {
+            started_tx.send(()).unwrap();
+            waiter.wait_until_ready().await
+        });
+        started_rx.await.unwrap();
+        tokio::task::yield_now().await;
+        assert!(!waiter_task.is_finished());
+
+        assert!(sandbox
+            .update_sandbox_storage(
+                path,
+                &initializer,
+                Arc::new(StorageDeviceGeneric::new("/ready-storage".to_string())),
+            )
+            .is_ok());
+        let device = waiter_task.await.unwrap().unwrap();
+        assert_eq!(device.path(), Some("/ready-storage"));
+        assert_eq!(initializer.phase(), StorageLifecyclePhase::Ready);
+        assert_eq!(initializer.ref_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn concurrent_storage_claims_receive_the_same_terminal_failure() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let path = "/run/kata-containers/storage-initialization-failure";
+
+        for cid in ["initializer", "waiter-a", "waiter-b"] {
+            sandbox.begin_storage_transaction(Some(cid)).unwrap();
+        }
+        let initializer = sandbox
+            .claim_storage_reference(Some("initializer"), path.to_string(), false)
+            .unwrap();
+        let waiter_a = sandbox
+            .claim_storage_reference(Some("waiter-a"), path.to_string(), false)
+            .unwrap();
+        let waiter_b = sandbox
+            .claim_storage_reference(Some("waiter-b"), path.to_string(), false)
+            .unwrap();
+        let failure = anyhow!("injected initializer failure");
+        initializer.fail_initialization(&failure);
+
+        let error_a = match waiter_a.wait_until_ready().await {
+            Ok(_) => panic!("first waiter unexpectedly observed ready storage"),
+            Err(error) => error,
+        };
+        let error_b = match waiter_b.wait_until_ready().await {
+            Ok(_) => panic!("second waiter unexpectedly observed ready storage"),
+            Err(error) => error,
+        };
+        assert_eq!(format!("{error_a:#}"), "injected initializer failure");
+        assert_eq!(format!("{error_b:#}"), format!("{error_a:#}"));
+        assert_eq!(initializer.phase(), StorageLifecyclePhase::Failed);
+        assert!(sandbox.add_sandbox_storage(path, false).is_err());
+    }
+
+    #[tokio::test]
+    async fn dropped_initializer_wakes_waiters_with_a_terminal_failure() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let path = "/run/kata-containers/dropped-storage-initializer";
+
+        let initializer = sandbox.add_sandbox_storage(path, false).unwrap();
+        let waiter = sandbox.add_sandbox_storage(path, false).unwrap();
+        drop(initializer);
+
+        let error = match waiter.wait_until_ready().await {
+            Ok(_) => panic!("waiter unexpectedly observed ready storage"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            format!("{error:#}"),
+            "sandbox storage initializer was dropped before completion"
+        );
+        assert_eq!(
+            sandbox.storages[path].phase(),
+            StorageLifecyclePhase::Failed
+        );
+    }
+
+    #[tokio::test]
+    async fn confidential_activation_is_owned_before_returned_fields_are_validated() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let path = "/run/kata-containers/confidential-activation-pending";
+        let backing = BlockDeviceIdentity::new(8, 7).unwrap();
+
+        sandbox
+            .reserve_confidential_storage_activation(path, backing, &HashSet::new())
+            .unwrap();
+        let pending = &sandbox.confidential_storage_activations[path];
+        assert_eq!(pending.activation_id, None);
+        assert_eq!(pending.mapper_device, None);
+        assert!(sandbox
+            .register_ordinary_storage_device("/ordinary-alias", backing, &HashSet::new())
+            .is_err());
+
+        sandbox
+            .record_confidential_storage_activation_id(path, "invalid id".to_string())
+            .unwrap();
+        assert_eq!(
+            sandbox.confidential_storage_activations[path]
+                .activation_id
+                .as_deref(),
+            Some("invalid id")
+        );
+        assert!(sandbox
+            .cancel_confidential_storage_reservation(path)
+            .is_err());
     }
 
     #[tokio::test]
@@ -1044,10 +1706,11 @@ mod tests {
 
         assert!(bind_mount(srcdir_path, destdir_path, &logger).is_ok());
 
-        s.add_sandbox_storage(destdir_path, false).await;
+        let claim = s.add_sandbox_storage(destdir_path, false).unwrap();
+        assert!(claim.is_initializer());
         let storage = StorageDeviceGeneric::new(destdir_path.to_string());
         assert!(s
-            .update_sandbox_storage(destdir_path, Arc::new(storage))
+            .update_sandbox_storage(destdir_path, &claim, Arc::new(storage))
             .is_ok());
         assert!(s.remove_sandbox_storage(destdir_path).await.is_ok());
 
@@ -1062,10 +1725,11 @@ mod tests {
             let other_dir_path = other_dir.path().to_str().unwrap();
             other_dir_str = other_dir_path.to_string();
 
-            s.add_sandbox_storage(other_dir_path, false).await;
+            let claim = s.add_sandbox_storage(other_dir_path, false).unwrap();
+            assert!(claim.is_initializer());
             let storage = StorageDeviceGeneric::new(other_dir_path.to_string());
             assert!(s
-                .update_sandbox_storage(other_dir_path, Arc::new(storage))
+                .update_sandbox_storage(other_dir_path, &claim, Arc::new(storage))
                 .is_ok());
         }
 
@@ -1081,9 +1745,13 @@ mod tests {
         let storage_path = "/tmp/testEphe";
 
         // Add a new sandbox storage
-        s.add_sandbox_storage(storage_path, false).await;
+        add_ready_storage(
+            &mut s,
+            storage_path,
+            Arc::new(StorageDeviceGeneric::default()),
+        );
         // Use the existing sandbox storage
-        let state = s.add_sandbox_storage(storage_path, false).await;
+        let state = s.add_sandbox_storage(storage_path, false).unwrap();
         assert!(
             state.ref_count().await > 1,
             "Expects false as the storage is not new."
@@ -1128,7 +1796,11 @@ mod tests {
         let mut sandbox = Sandbox::new(&logger).unwrap();
         let storage_path = "/run/kata-containers/shared/containers/passthrough/confidential-test";
 
-        sandbox.add_sandbox_storage(storage_path, false).await;
+        add_ready_storage(
+            &mut sandbox,
+            storage_path,
+            Arc::new(StorageDeviceGeneric::default()),
+        );
         let backing = BlockDeviceIdentity::new(8, 1).unwrap();
         let mapper = BlockDeviceIdentity::new(253, 1).unwrap();
         let active_mappers = HashSet::from([mapper]);
@@ -1141,14 +1813,14 @@ mod tests {
                 &active_mappers,
             )
             .unwrap();
-        sandbox.add_sandbox_storage(storage_path, false).await;
+        sandbox.add_sandbox_storage(storage_path, false).unwrap();
 
         assert!(!sandbox.remove_sandbox_storage(storage_path).await.unwrap());
         assert_eq!(
             sandbox
                 .confidential_storage_activations
                 .get(storage_path)
-                .map(|activation| activation.activation_id.as_str()),
+                .and_then(|activation| activation.activation_id.as_deref()),
             Some("activation-1")
         );
 
@@ -1158,9 +1830,9 @@ mod tests {
                 .confidential_storage_activations
                 .remove(storage_path),
             Some(ConfidentialStorageActivation {
-                activation_id: "activation-1".to_string(),
+                activation_id: Some("activation-1".to_string()),
                 backing_device: backing,
-                mapper_device: mapper,
+                mapper_device: Some(mapper),
             })
         );
     }
@@ -1322,17 +1994,19 @@ mod tests {
         let mut sandbox = Sandbox::new(&logger).unwrap();
         let storage_path = "/run/kata-containers/shared/containers/passthrough/retry-test";
         let attempts = Arc::new(AtomicU32::new(0));
-        sandbox.add_sandbox_storage(storage_path, false).await;
-        assert!(sandbox
-            .update_sandbox_storage(
-                storage_path,
-                Arc::new(FailsOnceDevice {
-                    attempts: attempts.clone(),
-                }),
-            )
-            .is_ok());
+        add_ready_storage(
+            &mut sandbox,
+            storage_path,
+            Arc::new(FailsOnceDevice {
+                attempts: attempts.clone(),
+            }),
+        );
 
         assert!(sandbox.remove_sandbox_storage(storage_path).await.is_err());
+        assert_eq!(
+            sandbox.storages[storage_path].phase(),
+            StorageLifecyclePhase::Recoverable
+        );
         assert_eq!(
             sandbox
                 .storages

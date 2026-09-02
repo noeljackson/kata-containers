@@ -263,7 +263,7 @@ pub async fn handle_multi_layer_erofs_group(
     fs::create_dir_all(&upper_mount).context("failed to create upper mount dir")?;
 
     if let Some(upper) = upper_storage {
-        wait_and_mount_layer(upper, &upper_mount, sandbox, &logger, None).await?;
+        wait_and_mount_layer(upper, &upper_mount, cid.as_deref(), sandbox, &logger, None).await?;
     } else {
         info!(
             logger,
@@ -337,9 +337,16 @@ pub async fn handle_multi_layer_erofs_group(
             let sandbox = Arc::clone(sandbox);
             let logger = logger.clone();
             async move {
-                wait_and_mount_layer(erofs, &lower_mount, &sandbox, &logger, base_dev_path)
-                    .await
-                    .map(|mount_info| (index, lower_mount, mount_info))
+                wait_and_mount_layer(
+                    erofs,
+                    &lower_mount,
+                    cid.as_deref(),
+                    &sandbox,
+                    &logger,
+                    base_dev_path,
+                )
+                .await
+                .map(|mount_info| (index, lower_mount, mount_info))
             }
         })
         .collect();
@@ -512,7 +519,7 @@ pub async fn handle_multi_layer_erofs_group(
         temp_mount_points.push(lm.display().to_string());
     }
     // Track the parent directory last so cleanup removes it only once empty.
-    track_temporary_mount_for_cleanup(sandbox, &temp_base, &logger).await?;
+    track_temporary_mount_for_cleanup(cid.as_deref(), sandbox, &temp_base, &logger).await?;
     temp_mount_points.push(temp_base.display().to_string());
 
     Ok(MultiLayerErofsResult {
@@ -523,27 +530,37 @@ pub async fn handle_multi_layer_erofs_group(
     })
 }
 
+/// Own the cleanup record of a temporary directory that is not itself a
+/// mount, such as the parent of the backing mounts, so container cleanup
+/// removes it once its mounts are gone.
 async fn track_temporary_mount_for_cleanup(
-    sandbox: &Arc<tokio::sync::Mutex<Sandbox>>,
+    cid: Option<&str>,
+    sandbox: &Arc<Mutex<Sandbox>>,
     mount_point: &Path,
     logger: &Logger,
 ) -> Result<()> {
-    let mount_point_str = mount_point.display().to_string();
-    let mut sandbox = sandbox.lock().await;
-    if !sandbox.storages.contains_key(&mount_point_str) {
-        sandbox.add_sandbox_storage(&mount_point_str, false).await;
-
-        let device = crate::storage::StorageDeviceGeneric::new(mount_point_str.clone());
-        sandbox
-            .update_sandbox_storage(&mount_point_str, Arc::new(device))
-            .map_err(|_| anyhow!("failed to update sandbox storage for {}", mount_point_str))?;
-
-        info!(
-            logger,
-            "Tracking temporary mount point for cleanup";
-            "mount-point" => &mount_point_str
-        );
+    let mount_point = mount_point.display().to_string();
+    let claim = sandbox
+        .lock()
+        .await
+        .claim_storage_reference(cid, mount_point.clone(), false)?;
+    if !claim.is_initializer() {
+        claim
+            .wait_until_ready()
+            .await
+            .with_context(|| format!("wait for temporary mount {mount_point}"))?;
+        return Ok(());
     }
+
+    let device = Arc::new(crate::storage::StorageDeviceGeneric::new(
+        mount_point.clone(),
+    ));
+    crate::storage::update_storage_device(sandbox, &mount_point, &claim, device, logger).await?;
+    info!(
+        logger,
+        "Tracking temporary mount point for cleanup";
+        "mount-point" => &mount_point
+    );
     Ok(())
 }
 
@@ -798,6 +815,7 @@ fn resolve_mkdir_path(
 async fn wait_and_mount_layer(
     layer: &Storage,
     layer_mount: &Path,
+    cid: Option<&str>,
     sandbox: &Arc<Mutex<Sandbox>>,
     logger: &Logger,
     base_dev_path: Option<String>,
@@ -916,7 +934,21 @@ async fn wait_and_mount_layer(
         kata_sys_util::mount::parse_mount_options(&mount_options)?
     };
 
-    baremount(
+    // Own the cleanup record before the mount becomes visible. If mounting or
+    // device installation fails, the enclosing transaction can still resume
+    // cleanup from this exact reference.
+    let mount_point = layer_mount.display().to_string();
+    let claim = sandbox
+        .lock()
+        .await
+        .claim_storage_reference(cid, mount_point.clone(), false)?;
+    if !claim.is_initializer() {
+        return Err(anyhow!(
+            "temporary mount storage initializer changed unexpectedly"
+        ));
+    }
+
+    if let Err(error) = baremount(
         Path::new(&dev_path),
         layer_mount,
         &layer.fstype,
@@ -924,10 +956,21 @@ async fn wait_and_mount_layer(
         options.as_str(),
         logger,
     )
-    .context("failed to mount layer")?;
+    .context("failed to mount layer")
+    {
+        claim.fail_initialization(&error);
+        return Err(error);
+    }
 
-    // After successfully mounting the layer, we track the mount point for cleanup.
-    track_temporary_mount_for_cleanup(sandbox, layer_mount, logger).await?;
+    let device = Arc::new(crate::storage::StorageDeviceGeneric::new(
+        mount_point.clone(),
+    ));
+    crate::storage::update_storage_device(sandbox, &mount_point, &claim, device, logger).await?;
+    info!(
+        logger,
+        "Tracking temporary mount point for cleanup";
+        "mount-point" => &mount_point
+    );
 
     Ok(LayerMountInfo {
         verity_device: verity_device_path,

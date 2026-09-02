@@ -147,15 +147,10 @@ impl CDHClient {
                 &req,
             )
             .await?;
-        let effective_access = response
-            .effective_access
-            .enum_value()
-            .map_err(|value| anyhow::anyhow!("CDH returned unknown volume access {value}"))?;
-
         Ok(ActivatedVolume {
             activation_id: response.activation_id,
             device_path: response.device_path,
-            effective_access,
+            effective_access: response.effective_access,
         })
     }
 
@@ -196,7 +191,7 @@ impl CDHClient {
 pub struct ActivatedVolume {
     pub activation_id: String,
     pub device_path: String,
-    pub effective_access: confidential_data_hub::VolumeAccess,
+    pub effective_access: protobuf::EnumOrUnknown<confidential_data_hub::VolumeAccess>,
 }
 
 pub async fn init_cdh_client(cdh_socket_uri: &str) -> Result<()> {
@@ -423,7 +418,7 @@ mod tests {
             _ctx: &::ttrpc::asynchronous::TtrpcContext,
             req: confidential_data_hub::ActivateVolumeRequest,
         ) -> ttrpc::error::Result<confidential_data_hub::ActivateVolumeResponse> {
-            assert_eq!(req.device_id, "8:16");
+            assert!(matches!(req.device_id.as_str(), "8:16" | "8:17"));
             assert_eq!(
                 req.manifest_uri,
                 "kbs:///tenant/storage-manifests/workspace-v1"
@@ -432,12 +427,21 @@ mod tests {
                 req.requested_access.enum_value().unwrap(),
                 confidential_data_hub::VolumeAccess::VOLUME_ACCESS_READ_WRITE
             );
+            let unknown_access = req.device_id == "8:17";
             Ok(confidential_data_hub::ActivateVolumeResponse {
-                activation_id: "activation-1".to_string(),
+                activation_id: if unknown_access {
+                    "activation-unknown-access".to_string()
+                } else {
+                    "activation-1".to_string()
+                },
                 device_path: "/dev/mapper/coco-pv-workspace".to_string(),
-                effective_access: protobuf::EnumOrUnknown::new(
-                    confidential_data_hub::VolumeAccess::VOLUME_ACCESS_READ_WRITE,
-                ),
+                effective_access: if unknown_access {
+                    protobuf::EnumOrUnknown::from_i32(99)
+                } else {
+                    protobuf::EnumOrUnknown::new(
+                        confidential_data_hub::VolumeAccess::VOLUME_ACCESS_READ_WRITE,
+                    )
+                },
                 ..Default::default()
             })
         }
@@ -447,7 +451,10 @@ mod tests {
             _ctx: &::ttrpc::asynchronous::TtrpcContext,
             req: confidential_data_hub::DeactivateVolumeRequest,
         ) -> ttrpc::error::Result<confidential_data_hub::DeactivateVolumeResponse> {
-            assert_eq!(req.activation_id, "activation-1");
+            assert!(matches!(
+                req.activation_id.as_str(),
+                "activation-1" | "activation-unknown-access"
+            ));
             Ok(confidential_data_hub::DeactivateVolumeResponse::new())
         }
     }
@@ -519,9 +526,27 @@ mod tests {
             ActivatedVolume {
                 activation_id: "activation-1".to_string(),
                 device_path: "/dev/mapper/coco-pv-workspace".to_string(),
-                effective_access: confidential_data_hub::VolumeAccess::VOLUME_ACCESS_READ_WRITE,
+                effective_access: protobuf::EnumOrUnknown::new(
+                    confidential_data_hub::VolumeAccess::VOLUME_ACCESS_READ_WRITE,
+                ),
             }
         );
+
+        let unknown_access = client
+            .activate_volume(
+                "8:17",
+                "kbs:///tenant/storage-manifests/workspace-v1",
+                confidential_data_hub::VolumeAccess::VOLUME_ACCESS_READ_WRITE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(unknown_access.activation_id, "activation-unknown-access");
+        assert_eq!(unknown_access.effective_access.enum_value(), Err(99));
+        client
+            .deactivate_volume(&unknown_access.activation_id)
+            .await
+            .unwrap();
+
         client
             .deactivate_volume(&activation.activation_id)
             .await
