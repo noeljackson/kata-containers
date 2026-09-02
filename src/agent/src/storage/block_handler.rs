@@ -266,7 +266,7 @@ fn validate_activation_fields(
     {
         return Err(anyhow!("CDH returned an invalid activation ID"));
     }
-    if activation.effective_access != VolumeAccess::VOLUME_ACCESS_READ_WRITE {
+    if activation.effective_access.enum_value() != Ok(VolumeAccess::VOLUME_ACCESS_READ_WRITE) {
         return Err(anyhow!(
             "CDH effective access does not match authorized readWrite access"
         ));
@@ -327,21 +327,51 @@ async fn activate_confidential_storage(
     sandbox
         .lock()
         .await
-        .ensure_confidential_backing_available(backing_device, &active_mappers)?;
+        .reserve_confidential_storage_activation(
+            &storage.mount_point,
+            backing_device,
+            &active_mappers,
+        )?;
 
-    let activation = crate::confidential_data_hub::activate_volume(
+    let activation = match crate::confidential_data_hub::activate_volume(
         dev_num,
         &options.manifest_uri,
         options.requested_access,
     )
     .await
-    .with_context(|| format!("activate confidential block device {dev_num}"))?;
+    {
+        Ok(activation) => activation,
+        Err(error) => {
+            return Err(error).context(format!(
+                "activate confidential block device {dev_num}; activation outcome is ambiguous and its ownership reservation was retained"
+            ));
+        }
+    };
+
+    // Record the opaque handle before inspecting any other CDH-controlled
+    // activation field. A failed validation or cleanup therefore retains an
+    // owner that later cleanup can retry.
+    if let Err(error) = sandbox
+        .lock()
+        .await
+        .record_confidential_storage_activation_id(
+            &storage.mount_point,
+            activation.activation_id.clone(),
+        )
+    {
+        let cleanup =
+            crate::confidential_data_hub::deactivate_volume(&activation.activation_id).await;
+        return Err(error).context(format!(
+            "record confidential activation ownership; cleanup result: {cleanup:?}"
+        ));
+    }
 
     let mapper_device = match validate_activation(&activation) {
         Ok(identity) => identity,
         Err(error) => {
             let cleanup =
-                crate::confidential_data_hub::deactivate_volume(&activation.activation_id).await;
+                deactivate_after_failure(&activation.activation_id, &storage.mount_point, sandbox)
+                    .await;
             return Err(error).context(format!(
                 "reject invalid confidential activation; cleanup result: {cleanup:?}"
             ));
@@ -351,7 +381,8 @@ async fn activate_confidential_storage(
         Ok(identities) => identities,
         Err(error) => {
             let cleanup =
-                crate::confidential_data_hub::deactivate_volume(&activation.activation_id).await;
+                deactivate_after_failure(&activation.activation_id, &storage.mount_point, sandbox)
+                    .await;
             return Err(error).context(format!(
                 "inspect activated confidential mapper identities; cleanup result: {cleanup:?}"
             ));
@@ -359,17 +390,17 @@ async fn activate_confidential_storage(
     };
     let registration = {
         let mut sandbox = sandbox.lock().await;
-        sandbox.register_confidential_storage_activation(
+        sandbox.bind_confidential_storage_mapper(
             &storage.mount_point,
-            activation.activation_id.clone(),
-            backing_device,
+            &activation.activation_id,
             mapper_device,
             &active_mappers,
         )
     };
     if let Err(error) = registration {
         let cleanup =
-            crate::confidential_data_hub::deactivate_volume(&activation.activation_id).await;
+            deactivate_after_failure(&activation.activation_id, &storage.mount_point, sandbox)
+                .await;
         return Err(error).context(format!(
             "register confidential block identities; cleanup result: {cleanup:?}"
         ));
@@ -392,6 +423,20 @@ async fn activate_confidential_storage(
             let cleanup =
                 deactivate_after_failure(&activation.activation_id, &storage.mount_point, sandbox)
                     .await;
+            if cleanup.is_err() {
+                match new_device(storage.mount_point.clone()) {
+                    Ok(device) => sandbox.lock().await.retain_failed_storage_device(
+                        &storage.mount_point,
+                        format!("{error:#}"),
+                        device,
+                    ),
+                    Err(device_error) => {
+                        return Err(error).context(format!(
+                            "mount activated confidential storage; cleanup result: {cleanup:?}; create recovery owner: {device_error:#}"
+                        ));
+                    }
+                }
+            }
             return Err(error).context(format!(
                 "mount activated confidential storage; cleanup result: {cleanup:?}"
             ));
@@ -610,7 +655,7 @@ mod tests {
         let valid = crate::confidential_data_hub::ActivatedVolume {
             activation_id: "4f24103d-3754-4f65-a091-92fc9cab87cc".to_string(),
             device_path: "/dev/mapper/coco-pv-a_b-C9".to_string(),
-            effective_access: VolumeAccess::VOLUME_ACCESS_READ_WRITE,
+            effective_access: protobuf::EnumOrUnknown::new(VolumeAccess::VOLUME_ACCESS_READ_WRITE),
         };
         assert!(validate_activation_fields(&valid).is_ok());
 
@@ -626,17 +671,28 @@ mod tests {
             crate::confidential_data_hub::ActivatedVolume {
                 activation_id: "activation/1".to_string(),
                 device_path: "/dev/mapper/coco-pv-volume".to_string(),
-                effective_access: VolumeAccess::VOLUME_ACCESS_READ_WRITE,
+                effective_access: protobuf::EnumOrUnknown::new(
+                    VolumeAccess::VOLUME_ACCESS_READ_WRITE,
+                ),
             },
             crate::confidential_data_hub::ActivatedVolume {
                 activation_id: "activation-1".to_string(),
                 device_path: CONFIDENTIAL_MAPPER_PREFIX.to_string(),
-                effective_access: VolumeAccess::VOLUME_ACCESS_READ_WRITE,
+                effective_access: protobuf::EnumOrUnknown::new(
+                    VolumeAccess::VOLUME_ACCESS_READ_WRITE,
+                ),
             },
             crate::confidential_data_hub::ActivatedVolume {
                 activation_id: "activation-1".to_string(),
                 device_path: "/dev/mapper/coco-pv-volume".to_string(),
-                effective_access: VolumeAccess::VOLUME_ACCESS_READ_ONLY,
+                effective_access: protobuf::EnumOrUnknown::new(
+                    VolumeAccess::VOLUME_ACCESS_READ_ONLY,
+                ),
+            },
+            crate::confidential_data_hub::ActivatedVolume {
+                activation_id: "activation-1".to_string(),
+                device_path: "/dev/mapper/coco-pv-volume".to_string(),
+                effective_access: protobuf::EnumOrUnknown::from_i32(99),
             },
         ];
         for activation in invalid {

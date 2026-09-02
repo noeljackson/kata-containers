@@ -36,7 +36,7 @@ use self::image_pull_handler::ImagePullHandler;
 use self::local_handler::LocalHandler;
 use self::multi_layer_erofs::{handle_multi_layer_erofs_group, is_multi_layer_storage};
 use crate::mount::{baremount, is_mounted, remove_mounts};
-use crate::sandbox::Sandbox;
+use crate::sandbox::{Sandbox, StorageClaim, StorageReference, StorageReferenceProgress};
 
 mod bind_watcher_handler;
 mod block_handler;
@@ -208,10 +208,94 @@ async fn handle_multi_layer_storage(
         "fstype" => &storage.fstype,
     );
 
-    let result = handle_multi_layer_erofs_group(storage, storages, cid, sandbox, logger).await?;
+    let group_mount_points = storages
+        .iter()
+        .filter(|storage| is_multi_layer_storage(storage))
+        .fold(Vec::new(), |mut mount_points, storage| {
+            if !mount_points.contains(&storage.mount_point) {
+                mount_points.push(storage.mount_point.clone());
+            }
+            mount_points
+        });
+    let mut claims = Vec::with_capacity(group_mount_points.len());
+    for mount_point in &group_mount_points {
+        let shared = storages
+            .iter()
+            .find(|storage| storage.mount_point == *mount_point)
+            .map_or(storage.shared, |storage| storage.shared);
+        let claim = sandbox.lock().await.claim_storage_reference(
+            cid.as_deref(),
+            mount_point.clone(),
+            shared,
+        )?;
+        claims.push((mount_point.clone(), claim));
+    }
+
+    let initializer_count = claims
+        .iter()
+        .filter(|(_, claim)| claim.is_initializer())
+        .count();
+    if initializer_count == 0 {
+        let mut device = None;
+        for (mount_point, claim) in claims {
+            let ready = claim
+                .wait_until_ready()
+                .await
+                .with_context(|| format!("wait for multi-layer sandbox storage {mount_point}"))?;
+            if device.is_none() {
+                device = Some(ready);
+            }
+        }
+        return Ok(Some(MultiLayerProcessResult {
+            device: device.ok_or_else(|| anyhow!("multi-layer storage group is empty"))?,
+            processed_mount_points: group_mount_points,
+            temp_mount_points: Vec::new(),
+            verity_devices: Vec::new(),
+        }));
+    }
+    if initializer_count != claims.len() {
+        let error =
+            anyhow!("multi-layer storage group has mixed initialized and uninitialized ownership");
+        for (_, claim) in &claims {
+            claim.fail_initialization(&error);
+        }
+        return Err(error);
+    }
+
+    let result = match handle_multi_layer_erofs_group(storage, storages, cid, sandbox, logger).await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            for (_, claim) in &claims {
+                claim.fail_initialization(&error);
+            }
+            return Err(error);
+        }
+    };
+
+    if result.processed_mount_points != group_mount_points {
+        let error =
+            anyhow!("multi-layer storage group changed after lifecycle ownership was claimed");
+        for (_, claim) in &claims {
+            claim.fail_initialization(&error);
+        }
+        return Err(error);
+    }
 
     // Create device for the mount point
-    let device = new_device(result.mount_point.clone())?;
+    let device = match new_device(result.mount_point.clone()) {
+        Ok(device) => device,
+        Err(error) => {
+            for (_, claim) in &claims {
+                claim.fail_initialization(&error);
+            }
+            return Err(error);
+        }
+    };
+
+    for (mount_point, claim) in &claims {
+        update_storage_device(sandbox, mount_point, claim, device.clone(), logger).await?;
+    }
 
     Ok(Some(MultiLayerProcessResult {
         device,
@@ -226,42 +310,35 @@ async fn handle_multi_layer_storage(
 async fn update_storage_device(
     sandbox: &Arc<Mutex<Sandbox>>,
     mount_point: &str,
+    claim: &StorageClaim,
     device: Arc<dyn StorageDevice>,
     logger: &Logger,
 ) -> Result<()> {
-    if let Err(device) = sandbox
-        .lock()
-        .await
-        .update_sandbox_storage(mount_point, device)
+    let install_device = device.clone();
+    if let Err(device) = claim.retain_initialization_cleanup_device(device) {
+        if let Err(cleanup_error) = device.cleanup() {
+            error!(logger, "failed to clean storage after losing initialization ownership"; "mount-point" => mount_point, "error" => ?cleanup_error);
+        }
+        return Err(anyhow!(
+            "storage initialization ownership was lost before installing device: {}",
+            mount_point
+        ));
+    }
+
+    if let Err(device) =
+        sandbox
+            .lock()
+            .await
+            .update_sandbox_storage(mount_point, claim, install_device)
     {
         error!(logger, "failed to update device for storage"; "mount-point" => mount_point);
-        if let Err(e) = sandbox
-            .lock()
-            .await
-            .remove_sandbox_storage(mount_point)
-            .await
-        {
-            warn!(logger, "failed to remove dummy sandbox storage"; "error" => ?e);
-        }
-        if let Err(e) = device.cleanup() {
-            error!(logger, "failed to clean state for storage device"; "mount-point" => mount_point, "error" => ?e);
-        } else if let Some(activation) = sandbox
-            .lock()
-            .await
-            .confidential_storage_activations
-            .get(mount_point)
-            .cloned()
-        {
-            if let Err(e) =
-                crate::confidential_data_hub::deactivate_volume(&activation.activation_id).await
-            {
-                error!(logger, "failed to deactivate confidential storage"; "mount-point" => mount_point, "error" => ?e);
-            } else if let Err(e) = sandbox
-                .lock()
-                .await
-                .remove_confidential_storage_activation(mount_point, &activation.activation_id)
-            {
-                error!(logger, "failed to unregister confidential storage identities"; "mount-point" => mount_point, "error" => ?e);
+        let recovery = claim.fail_initialization_with_device(
+            format!("failed to install initialized sandbox storage {mount_point}"),
+            device,
+        );
+        if let Err(device) = recovery {
+            if let Err(cleanup_error) = device.cleanup() {
+                error!(logger, "failed to clean unowned initialized storage"; "mount-point" => mount_point, "error" => ?cleanup_error);
             }
         }
         return Err(anyhow!(
@@ -289,29 +366,30 @@ pub async fn add_storages(
         block_handler::validate_confidential_storage_contract(storage)?;
     }
 
-    let mut storage_references = Vec::new();
-    let result = add_storages_inner(
-        logger,
-        storages,
-        sandbox,
-        cid.clone(),
-        &mut storage_references,
-    )
-    .await;
+    sandbox
+        .lock()
+        .await
+        .begin_storage_transaction(cid.as_deref())?;
+    let result = add_storages_inner(logger, storages, sandbox, cid.clone()).await;
     if let Err(error) = result {
+        let mut sandbox = sandbox.lock().await;
+        if let Some(cid) = cid.as_ref() {
+            // Mark ownership before the first rollback await. Cancellation must
+            // leave a discoverable cleanup transaction, not a stranded ledger.
+            sandbox.pending_storage_cleanup.insert(cid.clone());
+        }
         let rollback = {
-            let mut sandbox = sandbox.lock().await;
-            let rollback = remove_storage_references(&mut sandbox, &storage_references).await;
-            if rollback.is_err() {
-                if let Some(cid) = cid {
-                    sandbox
-                        .container_mounts
-                        .insert(cid.clone(), storage_references);
-                    sandbox.pending_storage_cleanup.insert(cid);
-                }
+            let mut cleanup = StorageReferenceCleanup::take(&mut sandbox, cid.as_deref());
+            match cleanup.run().await {
+                Ok(()) => cleanup.finish(),
+                Err(error) => Err(error),
             }
-            rollback
         };
+        if rollback.is_ok() {
+            if let Some(cid) = cid.as_ref() {
+                sandbox.pending_storage_cleanup.remove(cid);
+            }
+        }
         return Err(error).context(format!("roll back added storages: {rollback:?}"));
     }
 
@@ -323,7 +401,6 @@ async fn add_storages_inner(
     storages: Vec<Storage>,
     sandbox: &Arc<Mutex<Sandbox>>,
     cid: Option<String>,
-    storage_references: &mut Vec<String>,
 ) -> Result<Vec<String>> {
     let mut mount_list = Vec::new();
     let mut processed_mount_points = HashSet::new();
@@ -343,24 +420,6 @@ async fn add_storages_inner(
             // Register all processed mount points
             for mp in &result.processed_mount_points {
                 processed_mount_points.insert(mp.clone());
-            }
-
-            // Add sandbox storage for each mount point in the group.
-            // Derive the shared flag from the matching storage in the
-            // group rather than assuming all members share the trigger's
-            // flag.
-            for mp in &result.processed_mount_points {
-                let shared = storages
-                    .iter()
-                    .find(|s| s.mount_point == *mp)
-                    .map_or(storage.shared, |s| s.shared);
-                let state = sandbox.lock().await.add_sandbox_storage(mp, shared).await;
-                storage_references.push(mp.clone());
-
-                // Only update device for the first occurrence
-                if state.ref_count().await == 1 {
-                    update_storage_device(sandbox, mp, result.device.clone(), &logger).await?;
-                }
             }
 
             // Add the primary mount point to the list first, followed by
@@ -397,14 +456,17 @@ async fn add_storages_inner(
 
         // Standard storage handling
         let path = storage.mount_point.clone();
-        let state = sandbox
-            .lock()
-            .await
-            .add_sandbox_storage(&path, storage.shared)
-            .await;
-        storage_references.push(path.clone());
-        if state.ref_count().await > 1 {
-            if let Some(p) = state.path() {
+        let claim = sandbox.lock().await.claim_storage_reference(
+            cid.as_deref(),
+            path.clone(),
+            storage.shared,
+        )?;
+        if !claim.is_initializer() {
+            let device = claim
+                .wait_until_ready()
+                .await
+                .with_context(|| format!("wait for sandbox storage {path}"))?;
+            if let Some(p) = device.path() {
                 if !p.is_empty() {
                     mount_list.push(p.to_string());
                 }
@@ -424,15 +486,15 @@ async fn add_storages_inner(
             };
             handler.create_device(storage.clone(), &mut ctx).await
         } else {
-            return Err(anyhow!(
+            Err(anyhow!(
                 "Failed to find the storage handler {}",
                 storage.driver
-            ));
+            ))
         };
 
         match device {
             Ok(device) => {
-                update_storage_device(sandbox, &path, device.clone(), &logger).await?;
+                update_storage_device(sandbox, &path, &claim, device.clone(), &logger).await?;
                 if let Some(p) = device.path() {
                     if !p.is_empty() {
                         mount_list.push(p.to_string());
@@ -441,9 +503,7 @@ async fn add_storages_inner(
             }
             Err(e) => {
                 error!(logger, "failed to create device for storage"; "error" => ?e);
-                if let Err(e) = sandbox.lock().await.remove_sandbox_storage(&path).await {
-                    warn!(logger, "failed to remove dummy sandbox storage"; "error" => ?e);
-                }
+                claim.fail_initialization(&e);
                 return Err(e);
             }
         }
@@ -456,36 +516,158 @@ async fn add_storages_inner(
 ///
 /// The CDH handle remains recorded until deactivation succeeds, so a failed rollback can be
 /// retried by normal container or sandbox cleanup.
+#[cfg(test)]
 pub(crate) async fn remove_storage_references(
     sandbox: &mut Sandbox,
-    mount_points: &[String],
+    references: &mut [StorageReference],
 ) -> Result<()> {
-    for mount_point in mount_points {
-        let removed = if sandbox.storages.contains_key(mount_point) {
-            sandbox
-                .remove_sandbox_storage(mount_point)
-                .await
-                .with_context(|| format!("remove sandbox storage {mount_point}"))?
-        } else {
-            true
-        };
-        if !removed {
-            continue;
-        }
+    remove_storage_references_with(sandbox, references, &CdhVolumeDeactivator).await
+}
 
-        if let Some(activation) = sandbox
-            .confidential_storage_activations
-            .get(mount_point)
-            .cloned()
+#[async_trait::async_trait]
+trait VolumeDeactivator: Send + Sync {
+    async fn deactivate(&self, activation_id: &str) -> Result<()>;
+}
+
+struct CdhVolumeDeactivator;
+
+#[async_trait::async_trait]
+impl VolumeDeactivator for CdhVolumeDeactivator {
+    async fn deactivate(&self, activation_id: &str) -> Result<()> {
+        crate::confidential_data_hub::deactivate_volume(activation_id).await
+    }
+}
+
+/// Owns an in-progress cleanup ledger and restores it synchronously unless
+/// every reference completed. This also covers async cancellation and panic
+/// unwinding, not just ordinary `Result` failures.
+pub(crate) struct StorageReferenceCleanup<'a> {
+    sandbox: &'a mut Sandbox,
+    cid: Option<String>,
+    references: Option<Vec<StorageReference>>,
+}
+
+impl<'a> StorageReferenceCleanup<'a> {
+    pub(crate) fn take(sandbox: &'a mut Sandbox, cid: Option<&str>) -> Self {
+        let references = sandbox.take_storage_references(cid);
+        Self::from_references(sandbox, cid, references)
+    }
+
+    pub(crate) fn from_references(
+        sandbox: &'a mut Sandbox,
+        cid: Option<&str>,
+        references: Vec<StorageReference>,
+    ) -> Self {
+        Self {
+            sandbox,
+            cid: cid.map(ToString::to_string),
+            references: Some(references),
+        }
+    }
+
+    pub(crate) async fn run(&mut self) -> Result<()> {
+        self.run_with(&CdhVolumeDeactivator).await
+    }
+
+    async fn run_with<D: VolumeDeactivator>(&mut self, deactivator: &D) -> Result<()> {
+        let Self {
+            sandbox,
+            references,
+            ..
+        } = self;
+        remove_storage_references_with(
+            sandbox,
+            references
+                .as_mut()
+                .ok_or_else(|| anyhow!("storage cleanup transaction is already complete"))?,
+            deactivator,
+        )
+        .await
+    }
+
+    pub(crate) fn finish(&mut self) -> Result<()> {
+        if self
+            .references
+            .as_ref()
+            .ok_or_else(|| anyhow!("storage cleanup transaction is already complete"))?
+            .iter()
+            .any(|reference| reference.progress != StorageReferenceProgress::Complete)
         {
-            crate::confidential_data_hub::deactivate_volume(&activation.activation_id)
-                .await
-                .with_context(|| format!("deactivate confidential storage {mount_point}"))?;
-            sandbox
-                .remove_confidential_storage_activation(mount_point, &activation.activation_id)?;
+            return Err(anyhow!(
+                "storage cleanup transaction still has incomplete references"
+            ));
+        }
+        self.references = None;
+        Ok(())
+    }
+}
+
+impl Drop for StorageReferenceCleanup<'_> {
+    fn drop(&mut self) {
+        let Some(references) = self.references.take() else {
+            return;
+        };
+        if let Err(error) = self
+            .sandbox
+            .restore_storage_references(self.cid.as_deref(), references)
+        {
+            error!(
+                self.sandbox.logger,
+                "storage cleanup ledger changed while cleanup owned it";
+                "container-id" => self.cid.as_deref().unwrap_or("<sandbox>"),
+                "error" => format!("{error:#}"),
+            );
+        }
+    }
+}
+
+async fn remove_storage_references_with<D: VolumeDeactivator>(
+    sandbox: &mut Sandbox,
+    references: &mut [StorageReference],
+    deactivator: &D,
+) -> Result<()> {
+    for reference in references {
+        let mount_point = &reference.mount_point;
+
+        if reference.progress == StorageReferenceProgress::ReferenceHeld {
+            let removed = if sandbox.storages.contains_key(mount_point) {
+                sandbox
+                    .remove_sandbox_storage(mount_point)
+                    .await
+                    .with_context(|| format!("remove sandbox storage {mount_point}"))?
+            } else {
+                true
+            };
+            if !removed {
+                reference.progress = StorageReferenceProgress::Complete;
+                continue;
+            }
+            reference.progress = StorageReferenceProgress::StorageReleased;
         }
 
-        if sandbox.ordinary_storage_devices.contains_key(mount_point) {
+        if reference.progress == StorageReferenceProgress::StorageReleased {
+            if let Some(activation) = sandbox
+                .confidential_storage_activations
+                .get(mount_point)
+                .cloned()
+            {
+                let activation_id = activation.activation_id.as_deref().ok_or_else(|| {
+                    anyhow!(
+                        "confidential storage {mount_point} has an ambiguous activation in progress"
+                    )
+                })?;
+                deactivator
+                    .deactivate(activation_id)
+                    .await
+                    .with_context(|| format!("deactivate confidential storage {mount_point}"))?;
+                sandbox.remove_confidential_storage_activation(mount_point, activation_id)?;
+            }
+            reference.progress = StorageReferenceProgress::ConfidentialDeactivated;
+        }
+
+        if reference.progress == StorageReferenceProgress::ConfidentialDeactivated
+            && sandbox.ordinary_storage_devices.contains_key(mount_point)
+        {
             // A failed storage handler can leave a mount behind without installing
             // its StorageDevice. Keep that ambiguous identity protected and make
             // the transaction retryable until the mount is conclusively gone.
@@ -504,6 +686,9 @@ pub(crate) async fn remove_storage_references(
                     });
                 }
             }
+        }
+        if reference.progress == StorageReferenceProgress::ConfidentialDeactivated {
+            reference.progress = StorageReferenceProgress::Complete;
         }
     }
 
@@ -823,22 +1008,387 @@ mod tests {
         skip_if_not_root, skip_loop_by_user, skip_loop_if_not_root, skip_loop_if_root, TestUserType,
     };
 
+    fn add_ready_storage(
+        sandbox: &mut Sandbox,
+        mount_point: &str,
+        device: Arc<dyn StorageDevice>,
+    ) -> StorageClaim {
+        let claim = sandbox.add_sandbox_storage(mount_point, false).unwrap();
+        assert!(claim.is_initializer());
+        assert!(sandbox
+            .update_sandbox_storage(mount_point, &claim, device)
+            .is_ok());
+        claim
+    }
+
     #[tokio::test]
     async fn storage_rollback_releases_every_reference() {
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut sandbox = Sandbox::new(&logger).unwrap();
         let mount_point = "/run/kata-containers/shared/containers/passthrough/rollback-test";
-        sandbox.add_sandbox_storage(mount_point, false).await;
-        sandbox.add_sandbox_storage(mount_point, false).await;
-
-        remove_storage_references(
+        add_ready_storage(
             &mut sandbox,
-            &[mount_point.to_string(), mount_point.to_string()],
-        )
-        .await
-        .unwrap();
+            mount_point,
+            Arc::new(StorageDeviceGeneric::default()),
+        );
+        sandbox.add_sandbox_storage(mount_point, false).unwrap();
+
+        let mut references = vec![
+            StorageReference::new(mount_point.to_string()),
+            StorageReference::new(mount_point.to_string()),
+        ];
+        remove_storage_references(&mut sandbox, &mut references)
+            .await
+            .unwrap();
 
         assert!(!sandbox.storages.contains_key(mount_point));
+    }
+
+    #[tokio::test]
+    async fn multi_layer_reuser_observes_ready_storage_without_remounting() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let sandbox = Arc::new(Mutex::new(Sandbox::new(&logger).unwrap()));
+        let mount_point = "/run/kata-containers/ready-multi-layer";
+        let ready_path = "/run/kata-containers/ready-multi-layer-device";
+        {
+            let mut sandbox = sandbox.lock().await;
+            let claim = sandbox.add_sandbox_storage(mount_point, false).unwrap();
+            assert!(sandbox
+                .update_sandbox_storage(
+                    mount_point,
+                    &claim,
+                    Arc::new(StorageDeviceGeneric::new(ready_path.to_string())),
+                )
+                .is_ok());
+            sandbox
+                .begin_storage_transaction(Some("multi-layer-reuser"))
+                .unwrap();
+        }
+        let storage = Storage {
+            mount_point: mount_point.to_string(),
+            options: vec!["X-kata.multi-layer=true".to_string()],
+            ..Default::default()
+        };
+        let cid = Some("multi-layer-reuser".to_string());
+
+        let result = handle_multi_layer_storage(
+            &logger,
+            &storage,
+            std::slice::from_ref(&storage),
+            &sandbox,
+            &cid,
+            &HashSet::new(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(result.device.path(), Some(ready_path));
+        let sandbox = sandbox.lock().await;
+        assert_eq!(
+            sandbox.container_storage_references["multi-layer-reuser"][0].mount_point,
+            mount_point
+        );
+        assert_eq!(sandbox.storages[mount_point].ref_count().await, 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_device_install_keeps_a_cleanup_owner() {
+        struct CountCleanup(Arc<AtomicU32>);
+
+        impl StorageDevice for CountCleanup {
+            fn path(&self) -> Option<&str> {
+                None
+            }
+
+            fn cleanup(&self) -> Result<()> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }
+        }
+
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let sandbox = Arc::new(Mutex::new(Sandbox::new(&logger).unwrap()));
+        let mount_point = "/run/kata-containers/cancelled-device-install";
+        let claim = sandbox
+            .lock()
+            .await
+            .add_sandbox_storage(mount_point, false)
+            .unwrap();
+        let attempts = Arc::new(AtomicU32::new(0));
+
+        let lock_blocker = sandbox.lock().await;
+        assert!(tokio::time::timeout(
+            std::time::Duration::from_millis(10),
+            update_storage_device(
+                &sandbox,
+                mount_point,
+                &claim,
+                Arc::new(CountCleanup(attempts.clone())),
+                &logger,
+            ),
+        )
+        .await
+        .is_err());
+        drop(lock_blocker);
+        drop(claim);
+
+        let mut sandbox = sandbox.lock().await;
+        assert_eq!(
+            sandbox.storages[mount_point].phase(),
+            crate::sandbox::StorageLifecyclePhase::Failed
+        );
+        assert!(sandbox.remove_sandbox_storage(mount_point).await.unwrap());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn partial_cleanup_retry_does_not_release_a_completed_reference_twice() {
+        struct FailsOnceDevice(Arc<AtomicU32>);
+
+        impl StorageDevice for FailsOnceDevice {
+            fn path(&self) -> Option<&str> {
+                None
+            }
+
+            fn cleanup(&self) -> Result<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(anyhow!("injected second-storage cleanup failure"));
+                }
+                Ok(())
+            }
+        }
+
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let first = "/run/kata-containers/storage-cleanup-first";
+        let second = "/run/kata-containers/storage-cleanup-second";
+        let attempts = Arc::new(AtomicU32::new(0));
+
+        add_ready_storage(
+            &mut sandbox,
+            first,
+            Arc::new(StorageDeviceGeneric::default()),
+        );
+        sandbox.add_sandbox_storage(first, false).unwrap();
+        add_ready_storage(
+            &mut sandbox,
+            second,
+            Arc::new(FailsOnceDevice(attempts.clone())),
+        );
+        let mut references = vec![
+            StorageReference::new(first.to_string()),
+            StorageReference::new(second.to_string()),
+        ];
+
+        assert!(remove_storage_references(&mut sandbox, &mut references)
+            .await
+            .is_err());
+        assert_eq!(references[0].progress, StorageReferenceProgress::Complete);
+        assert_eq!(
+            references[1].progress,
+            StorageReferenceProgress::ReferenceHeld
+        );
+        assert_eq!(sandbox.storages[first].ref_count().await, 1);
+        assert_eq!(
+            sandbox.storages[second].phase(),
+            crate::sandbox::StorageLifecyclePhase::Recoverable
+        );
+
+        remove_storage_references(&mut sandbox, &mut references)
+            .await
+            .unwrap();
+        assert_eq!(sandbox.storages[first].ref_count().await, 1);
+        assert!(!sandbox.storages.contains_key(second));
+        assert!(references
+            .iter()
+            .all(|reference| reference.progress == StorageReferenceProgress::Complete));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn deactivation_failure_resumes_after_reference_release() {
+        struct FailsOnceDeactivator(Arc<AtomicU32>);
+
+        #[async_trait::async_trait]
+        impl VolumeDeactivator for FailsOnceDeactivator {
+            async fn deactivate(&self, _activation_id: &str) -> Result<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(anyhow!("injected deactivation failure"));
+                }
+                Ok(())
+            }
+        }
+
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let mount_point = "/run/kata-containers/deactivation-retry";
+        let mapper = crate::sandbox::BlockDeviceIdentity::new(253, 17).unwrap();
+        let claim = sandbox.add_sandbox_storage(mount_point, false).unwrap();
+        sandbox.retain_failed_storage_device(
+            mount_point,
+            "injected post-activation mount failure",
+            Arc::new(StorageDeviceGeneric::default()),
+        );
+        assert_eq!(
+            claim.phase(),
+            crate::sandbox::StorageLifecyclePhase::Recoverable
+        );
+        sandbox
+            .register_confidential_storage_activation(
+                mount_point,
+                "activation-retry".to_string(),
+                crate::sandbox::BlockDeviceIdentity::new(8, 17).unwrap(),
+                mapper,
+                &HashSet::from([mapper]),
+            )
+            .unwrap();
+        let attempts = Arc::new(AtomicU32::new(0));
+        let deactivator = FailsOnceDeactivator(attempts.clone());
+        let mut references = vec![StorageReference::new(mount_point.to_string())];
+
+        assert!(
+            remove_storage_references_with(&mut sandbox, &mut references, &deactivator,)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            references[0].progress,
+            StorageReferenceProgress::StorageReleased
+        );
+        assert!(!sandbox.storages.contains_key(mount_point));
+        assert!(sandbox
+            .confidential_storage_activations
+            .contains_key(mount_point));
+
+        remove_storage_references_with(&mut sandbox, &mut references, &deactivator)
+            .await
+            .unwrap();
+        assert_eq!(references[0].progress, StorageReferenceProgress::Complete);
+        assert!(!sandbox
+            .confidential_storage_activations
+            .contains_key(mount_point));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn ambiguous_activation_fails_closed_without_dropping_ownership() {
+        struct UnexpectedDeactivator;
+
+        #[async_trait::async_trait]
+        impl VolumeDeactivator for UnexpectedDeactivator {
+            async fn deactivate(&self, _activation_id: &str) -> Result<()> {
+                panic!("an activation without an ID must not be deactivated by guesswork");
+            }
+        }
+
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let mount_point = "/run/kata-containers/ambiguous-activation";
+        let claim = sandbox.add_sandbox_storage(mount_point, false).unwrap();
+        claim.fail_initialization(&anyhow!("injected activation transport failure"));
+        sandbox
+            .reserve_confidential_storage_activation(
+                mount_point,
+                crate::sandbox::BlockDeviceIdentity::new(8, 18).unwrap(),
+                &HashSet::new(),
+            )
+            .unwrap();
+        let mut references = vec![StorageReference::new(mount_point.to_string())];
+
+        for _ in 0..2 {
+            let error = remove_storage_references_with(
+                &mut sandbox,
+                &mut references,
+                &UnexpectedDeactivator,
+            )
+            .await
+            .unwrap_err();
+            assert!(format!("{error:#}").contains("ambiguous activation in progress"));
+            assert_eq!(
+                references[0].progress,
+                StorageReferenceProgress::StorageReleased
+            );
+            assert!(!sandbox.storages.contains_key(mount_point));
+            assert!(sandbox
+                .confidential_storage_activations
+                .contains_key(mount_point));
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_cleanup_restores_progress_before_releasing_ownership() {
+        struct PendingDeactivator;
+        struct SuccessfulDeactivator;
+
+        #[async_trait::async_trait]
+        impl VolumeDeactivator for PendingDeactivator {
+            async fn deactivate(&self, _activation_id: &str) -> Result<()> {
+                std::future::pending().await
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl VolumeDeactivator for SuccessfulDeactivator {
+            async fn deactivate(&self, _activation_id: &str) -> Result<()> {
+                Ok(())
+            }
+        }
+
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let cid = "cancelled-cleanup";
+        let mount_point = "/run/kata-containers/cancelled-cleanup";
+        sandbox.begin_storage_transaction(Some(cid)).unwrap();
+        let claim = sandbox
+            .claim_storage_reference(Some(cid), mount_point.to_string(), false)
+            .unwrap();
+        assert!(sandbox
+            .update_sandbox_storage(
+                mount_point,
+                &claim,
+                Arc::new(StorageDeviceGeneric::default()),
+            )
+            .is_ok());
+        let mapper = crate::sandbox::BlockDeviceIdentity::new(253, 19).unwrap();
+        sandbox
+            .register_confidential_storage_activation(
+                mount_point,
+                "activation-cancelled".to_string(),
+                crate::sandbox::BlockDeviceIdentity::new(8, 19).unwrap(),
+                mapper,
+                &HashSet::from([mapper]),
+            )
+            .unwrap();
+
+        {
+            let mut cleanup = StorageReferenceCleanup::take(&mut sandbox, Some(cid));
+            assert!(tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                cleanup.run_with(&PendingDeactivator),
+            )
+            .await
+            .is_err());
+        }
+
+        assert_eq!(
+            sandbox.container_storage_references[cid][0].progress,
+            StorageReferenceProgress::StorageReleased
+        );
+        assert!(!sandbox.storages.contains_key(mount_point));
+        assert!(sandbox
+            .confidential_storage_activations
+            .contains_key(mount_point));
+
+        {
+            let mut cleanup = StorageReferenceCleanup::take(&mut sandbox, Some(cid));
+            cleanup.run_with(&SuccessfulDeactivator).await.unwrap();
+            cleanup.finish().unwrap();
+        }
+        assert!(!sandbox.container_storage_references.contains_key(cid));
+        assert!(!sandbox
+            .confidential_storage_activations
+            .contains_key(mount_point));
     }
 
     #[tokio::test]
@@ -860,10 +1410,11 @@ mod tests {
         let mut sandbox = Sandbox::new(&logger).unwrap();
         let mount_point = "/run/kata-containers/shared/containers/passthrough/ordered-test";
         let attempts = Arc::new(AtomicU32::new(0));
-        sandbox.add_sandbox_storage(mount_point, false).await;
-        assert!(sandbox
-            .update_sandbox_storage(mount_point, Arc::new(FailingDevice(attempts.clone())))
-            .is_ok());
+        add_ready_storage(
+            &mut sandbox,
+            mount_point,
+            Arc::new(FailingDevice(attempts.clone())),
+        );
         sandbox
             .register_confidential_storage_activation(
                 mount_point,
@@ -874,11 +1425,10 @@ mod tests {
             )
             .unwrap();
 
-        assert!(
-            remove_storage_references(&mut sandbox, &[mount_point.to_string()])
-                .await
-                .is_err()
-        );
+        let mut references = vec![StorageReference::new(mount_point.to_string())];
+        assert!(remove_storage_references(&mut sandbox, &mut references)
+            .await
+            .is_err());
 
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
         assert!(sandbox.storages.contains_key(mount_point));
@@ -886,7 +1436,7 @@ mod tests {
             sandbox
                 .confidential_storage_activations
                 .get(mount_point)
-                .map(|activation| activation.activation_id.as_str()),
+                .and_then(|activation| activation.activation_id.as_deref()),
             Some("activation-1")
         );
     }
@@ -898,26 +1448,34 @@ mod tests {
 
         let mut cleaned = Sandbox::new(&logger).unwrap();
         let cleaned_path = "/run/kata-containers/nonexistent-ordinary-storage-test";
-        cleaned.add_sandbox_storage(cleaned_path, false).await;
+        add_ready_storage(
+            &mut cleaned,
+            cleaned_path,
+            Arc::new(StorageDeviceGeneric::default()),
+        );
         cleaned
             .register_ordinary_storage_device(cleaned_path, identity, &HashSet::new())
             .unwrap();
-        remove_storage_references(&mut cleaned, &[cleaned_path.to_string()])
+        let mut references = vec![StorageReference::new(cleaned_path.to_string())];
+        remove_storage_references(&mut cleaned, &mut references)
             .await
             .unwrap();
         assert!(!cleaned.ordinary_storage_devices.contains_key(cleaned_path));
 
         let mut mounted = Sandbox::new(&logger).unwrap();
         let mounted_path = "/proc";
-        mounted.add_sandbox_storage(mounted_path, false).await;
+        add_ready_storage(
+            &mut mounted,
+            mounted_path,
+            Arc::new(StorageDeviceGeneric::default()),
+        );
         mounted
             .register_ordinary_storage_device(mounted_path, identity, &HashSet::new())
             .unwrap();
-        assert!(
-            remove_storage_references(&mut mounted, &[mounted_path.to_string()])
-                .await
-                .is_err()
-        );
+        let mut references = vec![StorageReference::new(mounted_path.to_string())];
+        assert!(remove_storage_references(&mut mounted, &mut references)
+            .await
+            .is_err());
         assert!(mounted.ordinary_storage_devices.contains_key(mounted_path));
     }
 
