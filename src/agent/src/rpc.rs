@@ -86,9 +86,9 @@ use crate::network::setup_guest_dns;
 use crate::passfd_io;
 use crate::pci;
 use crate::random;
-use crate::sandbox::{Sandbox, SandboxError};
+use crate::sandbox::{Sandbox, SandboxError, StorageReference};
 use crate::storage::{
-    add_storages, remove_storage_references, update_ephemeral_mounts, STORAGE_HANDLERS,
+    add_storages, update_ephemeral_mounts, StorageReferenceCleanup, STORAGE_HANDLERS,
 };
 use crate::util;
 use crate::version::{AGENT_VERSION, API_VERSION};
@@ -2218,24 +2218,35 @@ async fn remove_container_resources(sandbox: &mut Sandbox, cid: &str) -> Result<
     // cleanup without attempting to destroy an already-destroyed container a second time.
     sandbox.pending_storage_cleanup.insert(cid.to_string());
 
-    let mut cmounts: Vec<String> = vec![];
-
-    // Find the sandbox storage used by this container
-    let mounts = sandbox.container_mounts.get(cid);
-    if let Some(mounts) = mounts {
-        for m in mounts.iter() {
-            if sandbox.storages.contains_key(m)
-                || sandbox.confidential_storage_activations.contains_key(m)
-                || sandbox.ordinary_storage_devices.contains_key(m)
-            {
-                cmounts.push(m.to_string());
-            }
-        }
+    let has_ledger = sandbox.container_storage_references.contains_key(cid);
+    let mut storage_references = sandbox.take_storage_references(Some(cid));
+    if !has_ledger {
+        // Compatibility for state created before the progress ledger was populated.
+        storage_references = sandbox
+            .container_mounts
+            .get(cid)
+            .into_iter()
+            .flatten()
+            .filter(|mount_point| {
+                sandbox.storages.contains_key(*mount_point)
+                    || sandbox
+                        .confidential_storage_activations
+                        .contains_key(*mount_point)
+                    || sandbox.ordinary_storage_devices.contains_key(*mount_point)
+            })
+            .cloned()
+            .map(StorageReference::new)
+            .collect();
     }
-
-    remove_storage_references(sandbox, &cmounts)
-        .await
-        .with_context(|| format!("remove storage references for container {cid}"))?;
+    {
+        let mut cleanup =
+            StorageReferenceCleanup::from_references(sandbox, Some(cid), storage_references);
+        cleanup
+            .run()
+            .await
+            .with_context(|| format!("remove storage references for container {cid}"))?;
+        cleanup.finish()?;
+    }
 
     // Cleanup dm-verity devices for this container (after all mounts are unmounted)
     if let Some(verity_devices) = sandbox.container_verity_devices.remove(cid) {
@@ -2262,6 +2273,7 @@ async fn destroy_sandbox_resources(sandbox: &mut Sandbox) -> Result<()> {
         .containers
         .keys()
         .chain(sandbox.container_mounts.keys())
+        .chain(sandbox.container_storage_references.keys())
         .chain(sandbox.pending_storage_cleanup.iter())
         .cloned()
         .collect();
@@ -2271,6 +2283,16 @@ async fn destroy_sandbox_resources(sandbox: &mut Sandbox) -> Result<()> {
     for cid in cleanup_ids {
         remove_container_resources(sandbox, &cid).await?;
     }
+
+    {
+        let mut cleanup = StorageReferenceCleanup::take(sandbox, None);
+        cleanup
+            .run()
+            .await
+            .context("remove sandbox storage references")?;
+        cleanup.finish()?;
+    }
+    sandbox.mounts.clear();
 
     Ok(())
 }
@@ -2830,6 +2852,7 @@ async fn cdh_handler_sealed_secrets(oci: &mut Spec) -> Result<()> {
 #[cfg(test)]
 #[allow(dead_code)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::*;
@@ -2849,6 +2872,18 @@ mod tests {
     use which::which;
 
     const CGROUP_PARENT: &str = "kata.agent.test.k8s.io";
+
+    fn add_ready_storage(sandbox: &mut Sandbox, mount_point: &str) {
+        let claim = sandbox.add_sandbox_storage(mount_point, false).unwrap();
+        assert!(claim.is_initializer());
+        assert!(sandbox
+            .update_sandbox_storage(
+                mount_point,
+                &claim,
+                Arc::new(crate::storage::StorageDeviceGeneric::default()),
+            )
+            .is_ok());
+    }
 
     fn check_command(cmd: &str) -> bool {
         which(cmd).is_ok()
@@ -2994,7 +3029,7 @@ mod tests {
         let mut sandbox = Sandbox::new(&logger).unwrap();
         let cid = "failed-create";
         let mount_point = "/run/kata-containers/shared/containers/passthrough/failed-create";
-        sandbox.add_sandbox_storage(mount_point, false).await;
+        add_ready_storage(&mut sandbox, mount_point);
         sandbox
             .container_mounts
             .insert(cid.to_string(), vec![mount_point.to_string()]);
@@ -3017,6 +3052,80 @@ mod tests {
         assert!(!sandbox.storages.contains_key(mount_point));
         assert!(!sandbox.container_mounts.contains_key(cid));
         assert!(!sandbox.pending_storage_cleanup.contains(cid));
+    }
+
+    #[tokio::test]
+    async fn remove_container_resumes_at_first_incomplete_storage_reference() {
+        struct FailsOnceDevice(Arc<AtomicU32>);
+
+        impl kata_types::mount::StorageDevice for FailsOnceDevice {
+            fn path(&self) -> Option<&str> {
+                None
+            }
+
+            fn cleanup(&self) -> Result<()> {
+                if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+                    return Err(anyhow!("injected later-reference cleanup failure"));
+                }
+                Ok(())
+            }
+        }
+
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let cid = "partial-storage-cleanup";
+        let first = "/run/kata-containers/partial-cleanup-first";
+        let second = "/run/kata-containers/partial-cleanup-second";
+        let attempts = Arc::new(AtomicU32::new(0));
+
+        sandbox.begin_storage_transaction(Some(cid)).unwrap();
+        let first_claim = sandbox
+            .claim_storage_reference(Some(cid), first.to_string(), false)
+            .unwrap();
+        assert!(first_claim.is_initializer());
+        assert!(sandbox
+            .update_sandbox_storage(
+                first,
+                &first_claim,
+                Arc::new(crate::storage::StorageDeviceGeneric::default()),
+            )
+            .is_ok());
+        sandbox.add_sandbox_storage(first, false).unwrap();
+
+        let second_claim = sandbox
+            .claim_storage_reference(Some(cid), second.to_string(), false)
+            .unwrap();
+        assert!(second_claim.is_initializer());
+        assert!(sandbox
+            .update_sandbox_storage(
+                second,
+                &second_claim,
+                Arc::new(FailsOnceDevice(attempts.clone())),
+            )
+            .is_ok());
+        sandbox
+            .container_mounts
+            .insert(cid.to_string(), vec![first.to_string(), second.to_string()]);
+
+        assert!(remove_container_resources(&mut sandbox, cid).await.is_err());
+        let ledger = &sandbox.container_storage_references[cid];
+        assert_eq!(
+            ledger[0].progress,
+            crate::sandbox::StorageReferenceProgress::Complete
+        );
+        assert_eq!(
+            ledger[1].progress,
+            crate::sandbox::StorageReferenceProgress::ReferenceHeld
+        );
+        assert_eq!(sandbox.storages[first].ref_count().await, 1);
+        assert!(sandbox.pending_storage_cleanup.contains(cid));
+
+        remove_container_resources(&mut sandbox, cid).await.unwrap();
+        assert_eq!(sandbox.storages[first].ref_count().await, 1);
+        assert!(!sandbox.storages.contains_key(second));
+        assert!(!sandbox.container_storage_references.contains_key(cid));
+        assert!(!sandbox.pending_storage_cleanup.contains(cid));
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -3065,8 +3174,8 @@ mod tests {
         let normal_mount = "/run/kata-containers/shared/containers/passthrough/normal";
         let pending_mount = "/run/kata-containers/shared/containers/passthrough/pending";
 
-        sandbox.add_sandbox_storage(normal_mount, false).await;
-        sandbox.add_sandbox_storage(pending_mount, false).await;
+        add_ready_storage(&mut sandbox, normal_mount);
+        add_ready_storage(&mut sandbox, pending_mount);
         sandbox
             .container_mounts
             .insert(normal_cid.to_string(), vec![normal_mount.to_string()]);
