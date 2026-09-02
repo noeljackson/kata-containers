@@ -1035,7 +1035,7 @@ impl AgentPolicy {
                 devices.push(device);
 
                 linux.Devices.push(KataLinuxDevice {
-                    Type: "".to_string(),
+                    Type: "b".to_string(),
                     Path: volumeDevice.devicePath.clone(),
                 })
             }
