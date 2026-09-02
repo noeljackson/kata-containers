@@ -275,6 +275,105 @@ ConfidentialStorageTest if {
     }
 
     #[tokio::test]
+    async fn test_volume_device_policy_binds_the_block_request_contract() {
+        let rules_path = path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rules.rego");
+        let mut rules = fs::read_to_string(rules_path).expect("rules.rego should open");
+        rules.push_str(
+            r#"
+policy_data := {"devices": {"vfio": {"device_path": "/dev/vfio"}}}
+default VolumeDeviceIdentityTest := false
+VolumeDeviceIdentityTest if {
+    allow_devices(input.policy_devices, input.request.devices, input.request.OCI)
+    allow_linux_devices(input.policy_oci_devices, input.request.OCI.Linux.Devices)
+}
+"#,
+        );
+
+        async fn allowed(rules: &str, input: &serde_json::Value) -> bool {
+            let mut policy = AgentPolicy::new();
+            policy.set_policy(rules).await.unwrap();
+            policy
+                .allow_request("VolumeDeviceIdentityTest", &input.to_string())
+                .await
+                .unwrap()
+                .0
+        }
+
+        let base = serde_json::json!({
+            "policy_devices": [{
+                "id": "",
+                "type_": "",
+                "vm_path": "",
+                "container_path": "/dev/ordinary",
+                "options": []
+            }],
+            "policy_oci_devices": [{
+                "Type": "b",
+                "Path": "/dev/ordinary"
+            }],
+            "request": {
+                "devices": [{
+                    "id": "00/02",
+                    "type_": "blk",
+                    "vm_path": "/dev/vdc",
+                    "container_path": "/dev/ordinary",
+                    "options": []
+                }],
+                "OCI": {"Linux": {"Devices": [{
+                    "Type": "b",
+                    "Path": "/dev/ordinary",
+                    "Major": 8,
+                    "Minor": 2
+                }]}}
+            }
+        });
+        assert!(allowed(&rules, &base).await);
+
+        for (name, pointer, value) in [
+            (
+                "direct confidential mapper",
+                "/request/devices/0/vm_path",
+                serde_json::json!("/dev/mapper/coco-pv-secret"),
+            ),
+            (
+                "missing handler type",
+                "/request/devices/0/type_",
+                serde_json::json!(""),
+            ),
+            (
+                "non-block OCI type",
+                "/request/OCI/Linux/Devices/0/Type",
+                serde_json::json!("c"),
+            ),
+            (
+                "negative OCI major",
+                "/request/OCI/Linux/Devices/0/Major",
+                serde_json::json!(-1),
+            ),
+            (
+                "unmeasured handler options",
+                "/request/devices/0/options",
+                serde_json::json!(["host-controlled"]),
+            ),
+        ] {
+            let mut substituted = base.clone();
+            *substituted.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                !allowed(&rules, &substituted).await,
+                "accepted {name} substitution"
+            );
+        }
+
+        let mut duplicate_oci_path = base;
+        let duplicate = duplicate_oci_path["request"]["OCI"]["Linux"]["Devices"][0].clone();
+        duplicate_oci_path["request"]["OCI"]["Linux"]["Devices"]
+            .as_array_mut()
+            .unwrap()
+            .push(duplicate);
+        assert!(!allowed(&rules, &duplicate_oci_path).await);
+    }
+
+    #[tokio::test]
     async fn test_mount_source_advisory_regressions() {
         let rules_path = path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("rules.rego");
         let mut rules = fs::read_to_string(rules_path).expect("rules.rego should open");
