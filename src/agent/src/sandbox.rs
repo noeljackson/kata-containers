@@ -111,6 +111,44 @@ impl StorageState {
 
 pub type PciHostGuestMapping = HashMap<pci::Address, pci::Address>;
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub(crate) struct BlockDeviceIdentity {
+    pub(crate) major: i64,
+    pub(crate) minor: i64,
+}
+
+impl BlockDeviceIdentity {
+    pub(crate) fn new(major: i64, minor: i64) -> Result<Self> {
+        if major < 0 || minor < 0 {
+            return Err(anyhow!("block device major/minor must be nonnegative"));
+        }
+        Ok(Self { major, minor })
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self> {
+        let (major, minor) = value
+            .split_once(':')
+            .ok_or_else(|| anyhow!("block device identity must be major:minor"))?;
+        Self::new(
+            major.parse().context("parse block device major")?,
+            minor.parse().context("parse block device minor")?,
+        )
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ConfidentialStorageActivation {
+    pub(crate) activation_id: String,
+    pub(crate) backing_device: BlockDeviceIdentity,
+    pub(crate) mapper_device: BlockDeviceIdentity,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct ContainerDeviceExposure {
+    pub(crate) block_devices: HashSet<BlockDeviceIdentity>,
+    pub(crate) allows_all_block_devices: bool,
+}
+
 #[derive(Debug)]
 pub struct Sandbox {
     pub logger: Logger,
@@ -124,8 +162,14 @@ pub struct Sandbox {
     pub pending_storage_cleanup: HashSet<String>,
     /// dm-verity devices per container for cleanup
     pub container_verity_devices: HashMap<String, Vec<String>>,
-    /// CDH activation IDs keyed by the sandbox storage mount point.
-    pub confidential_storage_activations: HashMap<String, String>,
+    /// CDH activation and protected block identities keyed by storage mount point.
+    pub(crate) confidential_storage_activations: HashMap<String, ConfidentialStorageActivation>,
+    /// Ordinary mounted block identities keyed by storage mount point.
+    pub(crate) ordinary_storage_devices: HashMap<String, BlockDeviceIdentity>,
+    /// OCI/cgroup block exposure admitted for each container create transaction.
+    pub(crate) container_device_exposures: HashMap<String, ContainerDeviceExposure>,
+    /// Serializes admission of ordinary and confidential block identities.
+    confidential_device_admission: Arc<Mutex<()>>,
     pub uevent_map: HashMap<String, Uevent>,
     pub uevent_watchers: Vec<Option<UeventWatcher>>,
     pub shared_utsns: Namespace,
@@ -163,6 +207,9 @@ impl Sandbox {
             pending_storage_cleanup: HashSet::new(),
             container_verity_devices: HashMap::new(),
             confidential_storage_activations: HashMap::new(),
+            ordinary_storage_devices: HashMap::new(),
+            container_device_exposures: HashMap::new(),
+            confidential_device_admission: Arc::new(Mutex::new(())),
             uevent_map: HashMap::new(),
             uevent_watchers: Vec::new(),
             shared_utsns: Namespace::new(&logger),
@@ -256,25 +303,177 @@ impl Sandbox {
         }
     }
 
-    /// Associate a mounted sandbox storage with one CDH activation.
-    pub fn register_confidential_storage_activation(
+    pub(crate) fn confidential_device_admission(&self) -> Arc<Mutex<()>> {
+        self.confidential_device_admission.clone()
+    }
+
+    fn protected_block_devices(&self) -> HashSet<BlockDeviceIdentity> {
+        self.confidential_storage_activations
+            .values()
+            .flat_map(|activation| [activation.backing_device, activation.mapper_device])
+            .collect()
+    }
+
+    pub(crate) fn register_container_device_exposure(
+        &mut self,
+        cid: &str,
+        exposure: ContainerDeviceExposure,
+        active_mappers: &HashSet<BlockDeviceIdentity>,
+    ) -> Result<()> {
+        let mut protected = self.protected_block_devices();
+        protected.extend(active_mappers);
+        if exposure.allows_all_block_devices && !protected.is_empty() {
+            return Err(anyhow!(
+                "container wildcard device access overlaps confidential storage"
+            ));
+        }
+        if let Some(identity) = exposure.block_devices.intersection(&protected).next() {
+            return Err(anyhow!(
+                "container device exposure overlaps confidential block device {}:{}",
+                identity.major,
+                identity.minor
+            ));
+        }
+        if exposure == ContainerDeviceExposure::default() {
+            self.container_device_exposures.remove(cid);
+        } else {
+            self.container_device_exposures
+                .insert(cid.to_string(), exposure);
+        }
+        Ok(())
+    }
+
+    fn ensure_confidential_device_available(
+        &self,
+        identity: BlockDeviceIdentity,
+        active_mappers: &HashSet<BlockDeviceIdentity>,
+        registering_mapper: Option<BlockDeviceIdentity>,
+    ) -> Result<()> {
+        if self.protected_block_devices().contains(&identity) {
+            return Err(anyhow!(
+                "confidential block device identity {}:{} is already protected",
+                identity.major,
+                identity.minor
+            ));
+        }
+        if active_mappers.contains(&identity) && registering_mapper != Some(identity) {
+            return Err(anyhow!(
+                "block device identity {}:{} belongs to an active confidential mapper",
+                identity.major,
+                identity.minor
+            ));
+        }
+        if self
+            .ordinary_storage_devices
+            .values()
+            .any(|other| *other == identity)
+        {
+            return Err(anyhow!(
+                "confidential block device identity {}:{} is mounted as ordinary storage",
+                identity.major,
+                identity.minor
+            ));
+        }
+        if self.container_device_exposures.values().any(|exposure| {
+            exposure.allows_all_block_devices || exposure.block_devices.contains(&identity)
+        }) {
+            return Err(anyhow!(
+                "confidential block device identity {}:{} is exposed to a container",
+                identity.major,
+                identity.minor
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn ensure_confidential_backing_available(
+        &self,
+        backing_device: BlockDeviceIdentity,
+        active_mappers: &HashSet<BlockDeviceIdentity>,
+    ) -> Result<()> {
+        self.ensure_confidential_device_available(backing_device, active_mappers, None)
+    }
+
+    /// Associate one CDH activation with both confidential block identities.
+    pub(crate) fn register_confidential_storage_activation(
         &mut self,
         path: &str,
         activation_id: String,
+        backing_device: BlockDeviceIdentity,
+        mapper_device: BlockDeviceIdentity,
+        active_mappers: &HashSet<BlockDeviceIdentity>,
     ) -> Result<()> {
         if activation_id.is_empty() {
             return Err(anyhow!("confidential storage activation ID is empty"));
         }
+        if backing_device == mapper_device {
+            return Err(anyhow!(
+                "confidential backing and mapper block identities must differ"
+            ));
+        }
+        if !active_mappers.contains(&mapper_device) {
+            return Err(anyhow!(
+                "confidential mapper block identity is not active under the protected namespace"
+            ));
+        }
+        self.ensure_confidential_device_available(backing_device, active_mappers, None)?;
+        self.ensure_confidential_device_available(
+            mapper_device,
+            active_mappers,
+            Some(mapper_device),
+        )?;
         match self
             .confidential_storage_activations
             .entry(path.to_string())
         {
             std::collections::hash_map::Entry::Vacant(entry) => {
-                entry.insert(activation_id);
+                entry.insert(ConfidentialStorageActivation {
+                    activation_id,
+                    backing_device,
+                    mapper_device,
+                });
                 Ok(())
             }
             std::collections::hash_map::Entry::Occupied(_) => Err(anyhow!(
                 "confidential storage activation already exists for path {}",
+                path
+            )),
+        }
+    }
+
+    pub(crate) fn remove_confidential_storage_activation(
+        &mut self,
+        path: &str,
+        activation_id: &str,
+    ) -> Result<()> {
+        let activation = self
+            .confidential_storage_activations
+            .get(path)
+            .ok_or_else(|| anyhow!("confidential storage activation is not registered"))?;
+        if activation.activation_id != activation_id {
+            return Err(anyhow!(
+                "confidential storage activation ID does not match registered owner"
+            ));
+        }
+        self.confidential_storage_activations.remove(path);
+        Ok(())
+    }
+
+    pub(crate) fn register_ordinary_storage_device(
+        &mut self,
+        path: &str,
+        identity: BlockDeviceIdentity,
+        active_mappers: &HashSet<BlockDeviceIdentity>,
+    ) -> Result<()> {
+        self.ensure_confidential_device_available(identity, active_mappers, None)?;
+        match self.ordinary_storage_devices.entry(path.to_string()) {
+            Entry::Vacant(entry) => {
+                entry.insert(identity);
+                Ok(())
+            }
+            Entry::Occupied(entry) if *entry.get() == identity => Ok(()),
+            Entry::Occupied(_) => Err(anyhow!(
+                "ordinary storage path {} changed block identity",
                 path
             )),
         }
@@ -930,8 +1129,17 @@ mod tests {
         let storage_path = "/run/kata-containers/shared/containers/passthrough/confidential-test";
 
         sandbox.add_sandbox_storage(storage_path, false).await;
+        let backing = BlockDeviceIdentity::new(8, 1).unwrap();
+        let mapper = BlockDeviceIdentity::new(253, 1).unwrap();
+        let active_mappers = HashSet::from([mapper]);
         sandbox
-            .register_confidential_storage_activation(storage_path, "activation-1".to_string())
+            .register_confidential_storage_activation(
+                storage_path,
+                "activation-1".to_string(),
+                backing,
+                mapper,
+                &active_mappers,
+            )
             .unwrap();
         sandbox.add_sandbox_storage(storage_path, false).await;
 
@@ -940,7 +1148,7 @@ mod tests {
             sandbox
                 .confidential_storage_activations
                 .get(storage_path)
-                .map(String::as_str),
+                .map(|activation| activation.activation_id.as_str()),
             Some("activation-1")
         );
 
@@ -949,7 +1157,11 @@ mod tests {
             sandbox
                 .confidential_storage_activations
                 .remove(storage_path),
-            Some("activation-1".to_string())
+            Some(ConfidentialStorageActivation {
+                activation_id: "activation-1".to_string(),
+                backing_device: backing,
+                mapper_device: mapper,
+            })
         );
     }
 
@@ -958,16 +1170,133 @@ mod tests {
         let logger = slog::Logger::root(slog::Discard, o!());
         let mut sandbox = Sandbox::new(&logger).unwrap();
         let storage_path = "/run/kata-containers/shared/containers/passthrough/confidential-test";
+        let backing = BlockDeviceIdentity::new(8, 1).unwrap();
+        let mapper = BlockDeviceIdentity::new(253, 1).unwrap();
+        let active_mappers = HashSet::from([mapper]);
 
         assert!(sandbox
-            .register_confidential_storage_activation(storage_path, String::new())
+            .register_confidential_storage_activation(
+                storage_path,
+                String::new(),
+                backing,
+                mapper,
+                &active_mappers,
+            )
             .is_err());
         sandbox
-            .register_confidential_storage_activation(storage_path, "activation-1".to_string())
+            .register_confidential_storage_activation(
+                storage_path,
+                "activation-1".to_string(),
+                backing,
+                mapper,
+                &active_mappers,
+            )
             .unwrap();
         assert!(sandbox
-            .register_confidential_storage_activation(storage_path, "activation-2".to_string())
+            .register_confidential_storage_activation(
+                storage_path,
+                "activation-2".to_string(),
+                BlockDeviceIdentity::new(8, 2).unwrap(),
+                BlockDeviceIdentity::new(253, 2).unwrap(),
+                &HashSet::from([BlockDeviceIdentity::new(253, 2).unwrap()]),
+            )
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn confidential_block_identities_reject_every_ordinary_alias() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let backing = BlockDeviceIdentity::new(8, 1).unwrap();
+        let mapper = BlockDeviceIdentity::new(253, 7).unwrap();
+        let active_mappers = HashSet::from([mapper]);
+        sandbox
+            .register_confidential_storage_activation(
+                "/confidential",
+                "activation-1".to_string(),
+                backing,
+                mapper,
+                &active_mappers,
+            )
+            .unwrap();
+
+        for identity in [backing, mapper] {
+            let exposure = ContainerDeviceExposure {
+                block_devices: HashSet::from([identity]),
+                allows_all_block_devices: false,
+            };
+            assert!(sandbox
+                .register_container_device_exposure("alias", exposure, &active_mappers)
+                .is_err());
+            assert!(sandbox
+                .register_ordinary_storage_device("/ordinary", identity, &active_mappers)
+                .is_err());
+        }
+
+        assert!(sandbox
+            .register_container_device_exposure(
+                "wildcard",
+                ContainerDeviceExposure {
+                    block_devices: HashSet::new(),
+                    allows_all_block_devices: true,
+                },
+                &active_mappers,
+            )
+            .is_err());
+
+        let independent = BlockDeviceIdentity::new(8, 2).unwrap();
+        sandbox
+            .register_container_device_exposure(
+                "independent",
+                ContainerDeviceExposure {
+                    block_devices: HashSet::from([independent]),
+                    allows_all_block_devices: false,
+                },
+                &active_mappers,
+            )
+            .unwrap();
+        assert!(sandbox
+            .register_confidential_storage_activation(
+                "/overlap",
+                "activation-2".to_string(),
+                independent,
+                BlockDeviceIdentity::new(253, 8).unwrap(),
+                &HashSet::from([BlockDeviceIdentity::new(253, 8).unwrap()]),
+            )
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn stale_confidential_mapper_identity_is_protected_after_state_loss() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let mut sandbox = Sandbox::new(&logger).unwrap();
+        let stale_mapper = BlockDeviceIdentity::new(253, 9).unwrap();
+        let active_mappers = HashSet::from([stale_mapper]);
+
+        assert!(sandbox
+            .register_container_device_exposure(
+                "alias",
+                ContainerDeviceExposure {
+                    block_devices: HashSet::from([stale_mapper]),
+                    allows_all_block_devices: false,
+                },
+                &active_mappers,
+            )
+            .is_err());
+        assert!(sandbox
+            .register_ordinary_storage_device("/ordinary", stale_mapper, &active_mappers)
+            .is_err());
+
+        let backing = BlockDeviceIdentity::new(8, 9).unwrap();
+        sandbox
+            .register_confidential_storage_activation(
+                "/recovered",
+                "activation-recovered".to_string(),
+                backing,
+                stale_mapper,
+                &active_mappers,
+            )
+            .unwrap();
     }
 
     #[tokio::test]
