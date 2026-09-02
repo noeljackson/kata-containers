@@ -13,6 +13,7 @@ use std::sync::Arc;
 use anyhow::{anyhow, Context, Result};
 use kata_types::confidential_volume::{
     confidential_storage_mount_name, validate_confidential_manifest_uri,
+    KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT,
 };
 #[cfg(target_arch = "s390x")]
 use kata_types::device::DRIVER_BLK_CCW_TYPE;
@@ -47,7 +48,6 @@ use std::str::FromStr;
 const EPHEMERAL_ENCRYPTION_DRIVER_OPTION: &str = "encryption_key=ephemeral";
 const CONFIDENTIAL_STORAGE_FSTYPE: &str = "confidential-storage";
 const CONFIDENTIAL_MAPPER_PREFIX: &str = "/dev/mapper/coco-pv-";
-const CONFIDENTIAL_MOUNT_PREFIX: &str = "/run/kata-containers/shared/containers/passthrough/";
 const CONFIDENTIAL_EXT4_MOUNT_OPTIONS: [&str; 3] = ["nodev", "nosuid", "rw"];
 const MKFS_EXT4: &str = "mkfs.ext4";
 const BLOCK_EMPTYDIR_EXT4_MKFS_OPTS: [&str; 8] =
@@ -215,7 +215,7 @@ pub(crate) fn validate_confidential_storage_contract(storage: &Storage) -> Resul
     }
 
     let mount_name = confidential_storage_mount_name(&options.manifest_uri)?;
-    let expected_mount_point = format!("{CONFIDENTIAL_MOUNT_PREFIX}{mount_name}");
+    let expected_mount_point = format!("{KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT}/{mount_name}");
     if storage.mount_point != expected_mount_point {
         return Err(anyhow!(
             "confidential storage mount point does not match its manifest"
@@ -576,7 +576,7 @@ mod tests {
             driver: DRIVER_BLK_PCI_TYPE.to_string(),
             fstype: CONFIDENTIAL_STORAGE_FSTYPE.to_string(),
             mount_point: format!(
-                "{CONFIDENTIAL_MOUNT_PREFIX}{}",
+                "{KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT}/{}",
                 confidential_storage_mount_name(manifest_uri).unwrap()
             ),
             confidential_storage: protobuf::MessageField::some(
@@ -626,8 +626,10 @@ mod tests {
     #[test]
     fn confidential_storage_preflight_rejects_identity_and_fsgroup_substitution() {
         let mut wrong_mount = confidential_storage(ConfidentialStorageAccess::ReadWrite);
-        wrong_mount.mount_point =
-            format!("{CONFIDENTIAL_MOUNT_PREFIX}confidential-{}", "0".repeat(64));
+        wrong_mount.mount_point = format!(
+            "{KATA_CONFIDENTIAL_STORAGE_MOUNT_ROOT}/confidential-{}",
+            "0".repeat(64)
+        );
         assert!(validate_confidential_storage_contract(&wrong_mount).is_err());
 
         let mut wrong_driver = confidential_storage(ConfidentialStorageAccess::ReadWrite);
