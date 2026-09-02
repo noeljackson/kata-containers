@@ -39,6 +39,7 @@ use crate::device::scsi_device_handler::get_scsi_device_name;
 use crate::storage::{
     common_storage_handler, new_device, set_ownership, StorageContext, StorageHandler,
 };
+use crate::{device::active_confidential_mapper_identities, sandbox::BlockDeviceIdentity};
 use slog::Logger;
 #[cfg(target_arch = "s390x")]
 use std::str::FromStr;
@@ -88,7 +89,29 @@ async fn handle_block_storage(
     if let Some(confidential_storage) = options.confidential_storage {
         activate_confidential_storage(logger, storage, dev_num, &confidential_storage, sandbox)
             .await
-    } else if options.has_ephemeral_encryption {
+    } else {
+        let identity = BlockDeviceIdentity::parse(dev_num)?;
+        let admission = sandbox.lock().await.confidential_device_admission();
+        let admission_guard = admission.lock().await;
+        let active_mappers = active_confidential_mapper_identities()?;
+        sandbox.lock().await.register_ordinary_storage_device(
+            &storage.mount_point,
+            identity,
+            &active_mappers,
+        )?;
+        drop(admission_guard);
+
+        handle_ordinary_block_storage(logger, storage, &options, dev_num).await
+    }
+}
+
+async fn handle_ordinary_block_storage(
+    logger: &Logger,
+    storage: &Storage,
+    options: &BlockStorageDriverOptions,
+    dev_num: &str,
+) -> Result<Arc<dyn StorageDevice>> {
+    if options.has_ephemeral_encryption {
         let mkfs_opts = BLOCK_EMPTYDIR_EXT4_MKFS_OPTS.join(" ");
         crate::rpc::cdh_secure_mount(
             "block-device",
@@ -218,14 +241,17 @@ pub(crate) fn validate_confidential_storage_contract(storage: &Storage) -> Resul
     Ok(())
 }
 
-fn validate_activation(activation: &crate::confidential_data_hub::ActivatedVolume) -> Result<()> {
+fn validate_activation(
+    activation: &crate::confidential_data_hub::ActivatedVolume,
+) -> Result<BlockDeviceIdentity> {
     validate_activation_fields(activation)?;
     let metadata = fs::metadata(&activation.device_path)
         .with_context(|| format!("inspect activated mapper {}", activation.device_path))?;
     if !metadata.file_type().is_block_device() {
         return Err(anyhow!("CDH activation path is not a block device"));
     }
-    Ok(())
+    let device = metadata.rdev();
+    BlockDeviceIdentity::new(major(device) as i64, minor(device) as i64)
 }
 
 fn validate_activation_fields(
@@ -272,11 +298,19 @@ fn validate_activation_fields(
     Ok(())
 }
 
-async fn deactivate_after_failure(activation_id: &str, mount_point: &str) -> Result<()> {
+async fn deactivate_after_failure(
+    activation_id: &str,
+    mount_point: &str,
+    sandbox: &Arc<tokio::sync::Mutex<crate::sandbox::Sandbox>>,
+) -> Result<()> {
     if Path::new(mount_point).exists() {
         new_device(mount_point.to_string())?.cleanup()?;
     }
-    crate::confidential_data_hub::deactivate_volume(activation_id).await
+    crate::confidential_data_hub::deactivate_volume(activation_id).await?;
+    sandbox
+        .lock()
+        .await
+        .remove_confidential_storage_activation(mount_point, activation_id)
 }
 
 async fn activate_confidential_storage(
@@ -286,6 +320,15 @@ async fn activate_confidential_storage(
     options: &ConfidentialStorageDriverOptions,
     sandbox: &Arc<tokio::sync::Mutex<crate::sandbox::Sandbox>>,
 ) -> Result<Arc<dyn StorageDevice>> {
+    let backing_device = BlockDeviceIdentity::parse(dev_num)?;
+    let admission = sandbox.lock().await.confidential_device_admission();
+    let admission_guard = admission.lock().await;
+    let active_mappers = active_confidential_mapper_identities()?;
+    sandbox
+        .lock()
+        .await
+        .ensure_confidential_backing_available(backing_device, &active_mappers)?;
+
     let activation = crate::confidential_data_hub::activate_volume(
         dev_num,
         &options.manifest_uri,
@@ -294,10 +337,44 @@ async fn activate_confidential_storage(
     .await
     .with_context(|| format!("activate confidential block device {dev_num}"))?;
 
-    if let Err(error) = validate_activation(&activation) {
-        let _ = crate::confidential_data_hub::deactivate_volume(&activation.activation_id).await;
-        return Err(error);
+    let mapper_device = match validate_activation(&activation) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let cleanup =
+                crate::confidential_data_hub::deactivate_volume(&activation.activation_id).await;
+            return Err(error).context(format!(
+                "reject invalid confidential activation; cleanup result: {cleanup:?}"
+            ));
+        }
+    };
+    let active_mappers = match active_confidential_mapper_identities() {
+        Ok(identities) => identities,
+        Err(error) => {
+            let cleanup =
+                crate::confidential_data_hub::deactivate_volume(&activation.activation_id).await;
+            return Err(error).context(format!(
+                "inspect activated confidential mapper identities; cleanup result: {cleanup:?}"
+            ));
+        }
+    };
+    let registration = {
+        let mut sandbox = sandbox.lock().await;
+        sandbox.register_confidential_storage_activation(
+            &storage.mount_point,
+            activation.activation_id.clone(),
+            backing_device,
+            mapper_device,
+            &active_mappers,
+        )
+    };
+    if let Err(error) = registration {
+        let cleanup =
+            crate::confidential_data_hub::deactivate_volume(&activation.activation_id).await;
+        return Err(error).context(format!(
+            "register confidential block identities; cleanup result: {cleanup:?}"
+        ));
     }
+    drop(admission_guard);
 
     let mut mount = storage.clone();
     mount.source.clone_from(&activation.device_path);
@@ -313,23 +390,13 @@ async fn activate_confidential_storage(
         Ok(path) => path,
         Err(error) => {
             let cleanup =
-                deactivate_after_failure(&activation.activation_id, &storage.mount_point).await;
+                deactivate_after_failure(&activation.activation_id, &storage.mount_point, sandbox)
+                    .await;
             return Err(error).context(format!(
                 "mount activated confidential storage; cleanup result: {cleanup:?}"
             ));
         }
     };
-
-    if let Err(error) = sandbox
-        .lock()
-        .await
-        .register_confidential_storage_activation(&path, activation.activation_id.clone())
-    {
-        let cleanup = deactivate_after_failure(&activation.activation_id, &path).await;
-        return Err(error).context(format!(
-            "register confidential storage activation; cleanup result: {cleanup:?}"
-        ));
-    }
 
     new_device(path)
 }

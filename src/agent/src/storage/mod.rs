@@ -245,19 +245,23 @@ async fn update_storage_device(
         }
         if let Err(e) = device.cleanup() {
             error!(logger, "failed to clean state for storage device"; "mount-point" => mount_point, "error" => ?e);
-        } else if let Some(activation_id) = sandbox
+        } else if let Some(activation) = sandbox
             .lock()
             .await
             .confidential_storage_activations
-            .remove(mount_point)
+            .get(mount_point)
+            .cloned()
         {
-            if let Err(e) = crate::confidential_data_hub::deactivate_volume(&activation_id).await {
-                sandbox
-                    .lock()
-                    .await
-                    .confidential_storage_activations
-                    .insert(mount_point.to_string(), activation_id);
+            if let Err(e) =
+                crate::confidential_data_hub::deactivate_volume(&activation.activation_id).await
+            {
                 error!(logger, "failed to deactivate confidential storage"; "mount-point" => mount_point, "error" => ?e);
+            } else if let Err(e) = sandbox
+                .lock()
+                .await
+                .remove_confidential_storage_activation(mount_point, &activation.activation_id)
+            {
+                error!(logger, "failed to unregister confidential storage identities"; "mount-point" => mount_point, "error" => ?e);
             }
         }
         return Err(anyhow!(
@@ -469,15 +473,37 @@ pub(crate) async fn remove_storage_references(
             continue;
         }
 
-        if let Some(activation_id) = sandbox
+        if let Some(activation) = sandbox
             .confidential_storage_activations
             .get(mount_point)
             .cloned()
         {
-            crate::confidential_data_hub::deactivate_volume(&activation_id)
+            crate::confidential_data_hub::deactivate_volume(&activation.activation_id)
                 .await
                 .with_context(|| format!("deactivate confidential storage {mount_point}"))?;
-            sandbox.confidential_storage_activations.remove(mount_point);
+            sandbox
+                .remove_confidential_storage_activation(mount_point, &activation.activation_id)?;
+        }
+
+        if sandbox.ordinary_storage_devices.contains_key(mount_point) {
+            // A failed storage handler can leave a mount behind without installing
+            // its StorageDevice. Keep that ambiguous identity protected and make
+            // the transaction retryable until the mount is conclusively gone.
+            match is_mounted(mount_point) {
+                Ok(false) => {
+                    sandbox.ordinary_storage_devices.remove(mount_point);
+                }
+                Ok(true) => {
+                    return Err(anyhow!(
+                        "ordinary block storage remains mounted at {mount_point}"
+                    ));
+                }
+                Err(error) => {
+                    return Err(error).with_context(|| {
+                        format!("verify ordinary block storage cleanup at {mount_point}")
+                    });
+                }
+            }
         }
     }
 
@@ -839,7 +865,13 @@ mod tests {
             .update_sandbox_storage(mount_point, Arc::new(FailingDevice(attempts.clone())))
             .is_ok());
         sandbox
-            .register_confidential_storage_activation(mount_point, "activation-1".to_string())
+            .register_confidential_storage_activation(
+                mount_point,
+                "activation-1".to_string(),
+                crate::sandbox::BlockDeviceIdentity::new(8, 1).unwrap(),
+                crate::sandbox::BlockDeviceIdentity::new(253, 1).unwrap(),
+                &HashSet::from([crate::sandbox::BlockDeviceIdentity::new(253, 1).unwrap()]),
+            )
             .unwrap();
 
         assert!(
@@ -854,9 +886,39 @@ mod tests {
             sandbox
                 .confidential_storage_activations
                 .get(mount_point)
-                .map(String::as_str),
+                .map(|activation| activation.activation_id.as_str()),
             Some("activation-1")
         );
+    }
+
+    #[tokio::test]
+    async fn ordinary_storage_identity_is_removed_only_after_mount_is_gone() {
+        let logger = slog::Logger::root(slog::Discard, o!());
+        let identity = crate::sandbox::BlockDeviceIdentity::new(8, 1).unwrap();
+
+        let mut cleaned = Sandbox::new(&logger).unwrap();
+        let cleaned_path = "/run/kata-containers/nonexistent-ordinary-storage-test";
+        cleaned.add_sandbox_storage(cleaned_path, false).await;
+        cleaned
+            .register_ordinary_storage_device(cleaned_path, identity, &HashSet::new())
+            .unwrap();
+        remove_storage_references(&mut cleaned, &[cleaned_path.to_string()])
+            .await
+            .unwrap();
+        assert!(!cleaned.ordinary_storage_devices.contains_key(cleaned_path));
+
+        let mut mounted = Sandbox::new(&logger).unwrap();
+        let mounted_path = "/proc";
+        mounted.add_sandbox_storage(mounted_path, false).await;
+        mounted
+            .register_ordinary_storage_device(mounted_path, identity, &HashSet::new())
+            .unwrap();
+        assert!(
+            remove_storage_references(&mut mounted, &[mounted_path.to_string()])
+                .await
+                .is_err()
+        );
+        assert!(mounted.ordinary_storage_devices.contains_key(mounted_path));
     }
 
     #[test]
