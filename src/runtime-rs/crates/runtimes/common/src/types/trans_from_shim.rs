@@ -112,45 +112,6 @@ impl TryFrom<sandbox_api::CreateSandboxRequest> for SandboxRequest {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::format_dns_config;
-
-    fn strings(values: &[&str]) -> Vec<String> {
-        values.iter().map(|value| (*value).to_string()).collect()
-    }
-
-    #[test]
-    fn format_complete_dns_config() {
-        assert_eq!(
-            format_dns_config(
-                &strings(&["10.96.0.10", "2001:db8::53"]),
-                &strings(&["example.svc.cluster.local", "svc.cluster.local"]),
-                &strings(&["ndots:5", "single-request-reopen"]),
-            ),
-            strings(&[
-                "nameserver 10.96.0.10",
-                "nameserver 2001:db8::53",
-                "search example.svc.cluster.local svc.cluster.local",
-                "options ndots:5 single-request-reopen",
-            ])
-        );
-    }
-
-    #[test]
-    fn format_empty_dns_config() {
-        assert!(format_dns_config(&[], &[], &[]).is_empty());
-    }
-
-    #[test]
-    fn format_dns_config_omits_empty_servers_without_duplicates() {
-        assert_eq!(
-            format_dns_config(&strings(&["", "10.96.0.10"]), &[], &[]),
-            strings(&["nameserver 10.96.0.10"])
-        );
-    }
-}
-
 impl TryFrom<sandbox_api::StartSandboxRequest> for SandboxRequest {
     type Error = anyhow::Error;
     fn try_from(from: sandbox_api::StartSandboxRequest) -> Result<Self> {
@@ -372,5 +333,44 @@ impl TryFrom<api::ConnectRequest> for TaskRequest {
     type Error = anyhow::Error;
     fn try_from(from: api::ConnectRequest) -> Result<Self> {
         Ok(TaskRequest::ConnectContainer(ContainerID::new(&from.id)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_dns_config;
+
+    fn strings(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn format_complete_dns_config() {
+        assert_eq!(
+            format_dns_config(
+                &strings(&["10.96.0.10", "2001:db8::53"]),
+                &strings(&["example.svc.cluster.local", "svc.cluster.local"]),
+                &strings(&["ndots:5", "single-request-reopen"]),
+            ),
+            strings(&[
+                "nameserver 10.96.0.10",
+                "nameserver 2001:db8::53",
+                "search example.svc.cluster.local svc.cluster.local",
+                "options ndots:5 single-request-reopen",
+            ])
+        );
+    }
+
+    #[test]
+    fn format_empty_dns_config() {
+        assert!(format_dns_config(&[], &[], &[]).is_empty());
+    }
+
+    #[test]
+    fn format_dns_config_omits_empty_servers_without_duplicates() {
+        assert_eq!(
+            format_dns_config(&strings(&["", "10.96.0.10"]), &[], &[]),
+            strings(&["nameserver 10.96.0.10"])
+        );
     }
 }

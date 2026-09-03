@@ -1277,6 +1277,10 @@ mount_source_allows(p_mount, i_mount, bundle_id, sandbox_id) if {
 ######################################################################
 # Create container Storages
 
+expected_image_guest_pull_count := 1 if {
+    policy_data.cluster_config.guest_pull
+} else := 0
+
 allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
     print("allow_storages: p_storages =", p_storages)
     print("allow_storages: i_storages =", i_storages)
@@ -1287,6 +1291,7 @@ allow_storages(p_storages, i_storages, bundle_id, sandbox_id) if {
     confidential_storage_count := count([s | s := i_storages[_]; is_confidential_storage(s)])
     print("allow_storages: p_count =", p_count, "i_count =", i_count, "img_pull_count =", img_pull_count, "confidential_storage_count =", confidential_storage_count)
 
+    img_pull_count == expected_image_guest_pull_count
     p_count == i_count - img_pull_count - confidential_storage_count
 
     every i_storage in i_storages {

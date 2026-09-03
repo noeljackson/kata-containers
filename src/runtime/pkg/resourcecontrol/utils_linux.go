@@ -11,7 +11,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/containerd/cgroups"
+	"github.com/containerd/cgroups/v3"
+	cgroup1 "github.com/containerd/cgroups/v3/cgroup1"
 	systemdDbus "github.com/coreos/go-systemd/v22/dbus"
 	"github.com/godbus/dbus/v5"
 	"github.com/opencontainers/cgroups/systemd"
@@ -55,9 +56,9 @@ func newProperty(name string, units interface{}) systemdDbus.Property {
 	}
 }
 
-func cgroupHierarchy(path string) (cgroups.Hierarchy, cgroups.Path, error) {
+func cgroupHierarchy(path string) (cgroup1.Hierarchy, cgroup1.Path, error) {
 	if !IsSystemdCgroup(path) {
-		return cgroups.V1, cgroups.StaticPath(path), nil
+		return cgroup1.Default, cgroup1.StaticPath(path), nil
 	} else {
 		slice, unit, err := getSliceAndUnit(path)
 		if err != nil {
@@ -69,7 +70,7 @@ func cgroupHierarchy(path string) (cgroups.Hierarchy, cgroups.Path, error) {
 			return nil, nil, err
 		}
 
-		return cgroups.Systemd, cgroups.Slice(cgroupSlicePath, unit), nil
+		return cgroup1.Systemd, cgroup1.Slice(cgroupSlicePath, unit), nil
 	}
 }
 

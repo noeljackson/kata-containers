@@ -6,7 +6,9 @@ on:
       - reopened
       - synchronize
 
-permissions: {}
+permissions:
+  contents: read # Checkout the exact pull-request head and inspect its commit graph.
+  pull-requests: read # Read commit metadata consumed by the pinned policy actions.
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
@@ -21,24 +23,100 @@ env:
 jobs:
   commit-message-check:
     runs-on: ubuntu-22.04
+    timeout-minutes: 10
     env:
       PR_AUTHOR: ${{ github.event.pull_request.user.login }}
     name: Commit Message Check
     steps:
+    - name: Checkout policy projection
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      with:
+        fetch-depth: 0
+        persist-credentials: false
+        ref: ${{ github.event.pull_request.head.sha }}
+
+    - name: Test compact commit projection
+      run: .github/scripts/test-compact-pr-commits.sh
+
+    - name: Test downstream gate policy
+      run: .github/scripts/test-downstream-gatekeeper.py
+
+    - name: Select downstream policy commits
+      id: 'select-policy-commits'
+      env:
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        UPSTREAM_REF: main
+        UPSTREAM_REPOSITORY: kata-containers/kata-containers
+      run: |
+        if [[ "$(git rev-parse HEAD)" != "${PR_HEAD_SHA}" ]]; then
+          echo "Checkout does not match the pull-request head" >&2
+          exit 1
+        fi
+
+        read -r -a head_revision <<< "$(git rev-list --parents -n 1 "${PR_HEAD_SHA}")"
+        if (( ${#head_revision[@]} != 3 )); then
+          echo "Deployment candidate must be an exact two-parent composition" >&2
+          exit 1
+        fi
+
+        deployment_parent="${head_revision[1]}"
+        source_head="${head_revision[2]}"
+        if [[ "${deployment_parent}" != "${PR_BASE_SHA}" ]]; then
+          echo "First parent does not match the reviewed deployment base" >&2
+          exit 1
+        fi
+
+        git fetch --no-tags --no-recurse-submodules \
+          "https://github.com/${UPSTREAM_REPOSITORY}.git" \
+          "${UPSTREAM_REF}"
+        upstream_head="$(git rev-parse FETCH_HEAD)"
+        upstream_base="$(git merge-base "${source_head}" "${upstream_head}")"
+        if [[ "${upstream_base}" != "${upstream_head}" ]]; then
+          echo "Source is not based on the current declared upstream head" >&2
+          exit 1
+        fi
+
+        if [[ -n "$(git rev-list --min-parents=2 "${upstream_base}..${source_head}")" ]]; then
+          echo "Upstreamable source history must remain linear" >&2
+          exit 1
+        fi
+
+        source_count="$(git rev-list --count "${upstream_base}..${source_head}")"
+        if (( source_count == 0 )); then
+          echo "Composition contains no downstream source commits" >&2
+          exit 1
+        fi
+
+        policy_shas="$(
+          {
+            git rev-list --reverse "${upstream_base}..${source_head}"
+            printf '%s\n' "${PR_HEAD_SHA}"
+          } | jq -Rsc 'split("\n") | map(select(length > 0))'
+        )"
+        printf 'policy_shas=%s\n' "${policy_shas}" >> "${GITHUB_OUTPUT}"
+
     - name: Get PR Commits
       id: 'get-pr-commits'
-      uses: tim-actions/get-pr-commits@c64db31d359214d244884dd68f971a110b29ab83 # v1.2.0
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-        # Filter out revert commits
-        # The format of a revert commit is as follows:
-        #
-        # Revert "<original-subject-line>"
-        #
-        # The format of a re-re-vert commit as follows:
-        #
-        # Reapply "<original-subject-line>"
-        filter_out_pattern: '^Revert "|^Reapply "'
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        POLICY_SHAS: ${{ steps.select-policy-commits.outputs.policy_shas }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+      run: |
+        commits="$(
+          gh api --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}/commits?per_page=100" |
+          jq -c --argjson policy_shas "${POLICY_SHAS}" \
+            -f .github/scripts/compact-pr-commits.jq
+        )"
+        jq -e 'type == "array" and all(.[]; has("sha") and has("commit") and has("parents"))' \
+          <<< "${commits}" >/dev/null
+        byte_count="$(printf '%s' "${commits}" | wc -c)"
+        if (( byte_count > 100000 )); then
+          echo "Compact commit projection is too large for an action input: ${byte_count} bytes" >&2
+          exit 1
+        fi
+        printf 'commits=%s\n' "${commits}" >> "${GITHUB_OUTPUT}"
 
     - name: DCO Check
       uses: tim-actions/dco@f2279e6e62d5a7d9115b0cb8e837b777b1b02e21 # v1.1.0

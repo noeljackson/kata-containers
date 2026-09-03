@@ -349,6 +349,7 @@ externals:
     url: "https://github.com/containerd/nydus-snapshotter"
     version: "v0.15.16-0.20260824095544-aab11e826dd7"
     revision: "aab11e826dd7596c1c932905aef9cd307c05e26e"
+    # yamllint disable-line rule:line-length
     archive-sha256: "39a2b0c231e80fbc22ce90f6c4786f1cf96331fcc365e8cddd5bd99b8c262e4f"
 
   opa:

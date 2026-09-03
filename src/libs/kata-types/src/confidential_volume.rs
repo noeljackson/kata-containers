@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Codewire, Inc.
+//
 // SPDX-License-Identifier: Apache-2.0
 
 //! Strict declarations for turning a Kubernetes raw block device into guest-confidential

@@ -1582,91 +1582,6 @@ impl Sandbox for VirtSandbox {
     }
 }
 
-#[cfg(test)]
-mod agent_start_tests {
-    use super::{wait_for_agent_start_or_vm_exit, AgentStartOutcome};
-    use anyhow::anyhow;
-    use std::sync::Arc;
-    use std::time::Duration;
-    use tokio::sync::{oneshot, RwLock};
-
-    #[tokio::test]
-    async fn agent_connection_wins_while_vm_is_running() {
-        let (_vm_exit_tx, vm_exit_rx) = oneshot::channel();
-
-        let outcome = wait_for_agent_start_or_vm_exit(async { Ok(()) }, vm_exit_rx)
-            .await
-            .unwrap();
-
-        assert_eq!(outcome, AgentStartOutcome::Connected);
-    }
-
-    #[tokio::test]
-    async fn vm_exit_interrupts_a_pending_agent_connection() {
-        let (vm_exit_tx, vm_exit_rx) = oneshot::channel();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(10)).await;
-            vm_exit_tx.send(23).unwrap();
-        });
-
-        let outcome = wait_for_agent_start_or_vm_exit(std::future::pending(), vm_exit_rx)
-            .await
-            .unwrap();
-
-        assert_eq!(outcome, AgentStartOutcome::VmExited(23));
-    }
-
-    #[tokio::test]
-    async fn preexisting_vm_exit_rejects_agent_connection() {
-        let (vm_exit_tx, vm_exit_rx) = oneshot::channel();
-        vm_exit_tx.send(42).unwrap();
-
-        let outcome = wait_for_agent_start_or_vm_exit(async { Ok(()) }, vm_exit_rx)
-            .await
-            .unwrap();
-
-        assert_eq!(outcome, AgentStartOutcome::VmExited(42));
-    }
-
-    #[tokio::test]
-    async fn vm_exit_does_not_wait_for_sandbox_state_lock() {
-        let sandbox_state = Arc::new(RwLock::new(()));
-        let held_state = sandbox_state.write().await;
-        let (vm_exit_tx, vm_exit_rx) = oneshot::channel();
-        let state_for_watcher = sandbox_state.clone();
-
-        tokio::spawn(async move {
-            vm_exit_tx.send(23).unwrap();
-            let _state = state_for_watcher.write().await;
-        });
-
-        let outcome = tokio::time::timeout(
-            Duration::from_secs(1),
-            wait_for_agent_start_or_vm_exit(std::future::pending(), vm_exit_rx),
-        )
-        .await
-        .expect("VM exit must be observable while the state lock is held")
-        .unwrap();
-
-        assert_eq!(outcome, AgentStartOutcome::VmExited(23));
-        drop(held_state);
-    }
-
-    #[tokio::test]
-    async fn agent_connection_error_is_preserved() {
-        let (_vm_exit_tx, vm_exit_rx) = oneshot::channel();
-
-        let error = wait_for_agent_start_or_vm_exit(
-            async { Err(anyhow!("agent connection failed")) },
-            vm_exit_rx,
-        )
-        .await
-        .unwrap_err();
-
-        assert_eq!(error.to_string(), "agent connection failed");
-    }
-}
-
 #[async_trait]
 impl Persist for VirtSandbox {
     type State = crate::sandbox_persist::SandboxState;
@@ -1794,5 +1709,90 @@ impl Persist for VirtSandbox {
             factory: None,
             cancel_token: CancellationToken::default(),
         })
+    }
+}
+
+#[cfg(test)]
+mod agent_start_tests {
+    use super::{wait_for_agent_start_or_vm_exit, AgentStartOutcome};
+    use anyhow::anyhow;
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio::sync::{oneshot, RwLock};
+
+    #[tokio::test]
+    async fn agent_connection_wins_while_vm_is_running() {
+        let (_vm_exit_tx, vm_exit_rx) = oneshot::channel();
+
+        let outcome = wait_for_agent_start_or_vm_exit(async { Ok(()) }, vm_exit_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, AgentStartOutcome::Connected);
+    }
+
+    #[tokio::test]
+    async fn vm_exit_interrupts_a_pending_agent_connection() {
+        let (vm_exit_tx, vm_exit_rx) = oneshot::channel();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            vm_exit_tx.send(23).unwrap();
+        });
+
+        let outcome = wait_for_agent_start_or_vm_exit(std::future::pending(), vm_exit_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, AgentStartOutcome::VmExited(23));
+    }
+
+    #[tokio::test]
+    async fn preexisting_vm_exit_rejects_agent_connection() {
+        let (vm_exit_tx, vm_exit_rx) = oneshot::channel();
+        vm_exit_tx.send(42).unwrap();
+
+        let outcome = wait_for_agent_start_or_vm_exit(async { Ok(()) }, vm_exit_rx)
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, AgentStartOutcome::VmExited(42));
+    }
+
+    #[tokio::test]
+    async fn vm_exit_does_not_wait_for_sandbox_state_lock() {
+        let sandbox_state = Arc::new(RwLock::new(()));
+        let held_state = sandbox_state.write().await;
+        let (vm_exit_tx, vm_exit_rx) = oneshot::channel();
+        let state_for_watcher = sandbox_state.clone();
+
+        tokio::spawn(async move {
+            vm_exit_tx.send(23).unwrap();
+            let _state = state_for_watcher.write().await;
+        });
+
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(1),
+            wait_for_agent_start_or_vm_exit(std::future::pending(), vm_exit_rx),
+        )
+        .await
+        .expect("VM exit must be observable while the state lock is held")
+        .unwrap();
+
+        assert_eq!(outcome, AgentStartOutcome::VmExited(23));
+        drop(held_state);
+    }
+
+    #[tokio::test]
+    async fn agent_connection_error_is_preserved() {
+        let (_vm_exit_tx, vm_exit_rx) = oneshot::channel();
+
+        let error = wait_for_agent_start_or_vm_exit(
+            async { Err(anyhow!("agent connection failed")) },
+            vm_exit_rx,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.to_string(), "agent connection failed");
     }
 }
