@@ -14,8 +14,9 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/containerd/cgroups"
-	cgroupsv2 "github.com/containerd/cgroups/v2"
+	"github.com/containerd/cgroups/v3"
+	cgroup1 "github.com/containerd/cgroups/v3/cgroup1"
+	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )
@@ -161,7 +162,7 @@ func NewResourceController(path string, resources *specs.LinuxResources) (Resour
 		if err != nil {
 			return nil, err
 		}
-		cgroup, err = cgroups.New(cgroups.V1, cgroups.StaticPath(cgroupPath), resources)
+		cgroup, err = cgroup1.New(cgroup1.StaticPath(cgroupPath), resources)
 		if err != nil {
 			return nil, err
 		}
@@ -225,7 +226,7 @@ func NewSandboxResourceController(path string, resources *specs.LinuxResources, 
 		}
 
 		// load created cgroup and update with resources
-		cg, err := cgroups.Load(cgHierarchy, cgPath)
+		cg, err := cgroup1.Load(cgPath, cgroup1.WithHierarchy(cgHierarchy))
 		if err != nil {
 			if cg.Update(&sandboxResources); err != nil {
 				return nil, err
@@ -264,7 +265,7 @@ func LoadResourceController(path string, sandboxCgroupOnly bool) (ResourceContro
 			return nil, err
 		}
 
-		cgroup, err = cgroups.Load(cgHierarchy, cgPath)
+		cgroup, err = cgroup1.Load(cgPath, cgroup1.WithHierarchy(cgHierarchy))
 		if err != nil {
 			return nil, err
 		}
@@ -279,7 +280,7 @@ func LoadResourceController(path string, sandboxCgroupOnly bool) (ResourceContro
 				return nil, err
 			}
 		} else {
-			cgroup, err = cgroupsv2.LoadManager(unifiedMountpoint, path)
+			cgroup, err = cgroupsv2.Load(path, cgroupsv2.WithMountpoint(unifiedMountpoint))
 			if err != nil {
 				return nil, err
 			}
@@ -301,7 +302,7 @@ func (c *LinuxCgroup) Logger() *logrus.Entry {
 
 func (c *LinuxCgroup) Delete() error {
 	switch cg := c.cgroup.(type) {
-	case cgroups.Cgroup:
+	case cgroup1.Cgroup:
 		return cg.Delete()
 	case *cgroupsv2.Manager:
 		if IsSystemdCgroup(c.ID()) && c.sandboxCgroupOnly {
@@ -317,8 +318,8 @@ func (c *LinuxCgroup) Delete() error {
 
 func (c *LinuxCgroup) Stat() (interface{}, error) {
 	switch cg := c.cgroup.(type) {
-	case cgroups.Cgroup:
-		return cg.Stat(cgroups.IgnoreNotExist)
+	case cgroup1.Cgroup:
+		return cg.Stat(cgroup1.IgnoreNotExist)
 	case *cgroupsv2.Manager:
 		return cg.Stat()
 	default:
@@ -328,7 +329,7 @@ func (c *LinuxCgroup) Stat() (interface{}, error) {
 
 func (c *LinuxCgroup) AddProcess(pid int, subsystems ...string) error {
 	switch cg := c.cgroup.(type) {
-	case cgroups.Cgroup:
+	case cgroup1.Cgroup:
 		return cg.AddProc(uint64(pid))
 	case *cgroupsv2.Manager:
 		return cg.AddProc(uint64(pid))
@@ -339,8 +340,8 @@ func (c *LinuxCgroup) AddProcess(pid int, subsystems ...string) error {
 
 func (c *LinuxCgroup) AddThread(pid int, subsystems ...string) error {
 	switch cg := c.cgroup.(type) {
-	case cgroups.Cgroup:
-		return cg.AddTask(cgroups.Process{Pid: pid})
+	case cgroup1.Cgroup:
+		return cg.AddTask(cgroup1.Process{Pid: pid})
 	case *cgroupsv2.Manager:
 		return cg.AddProc(uint64(pid))
 	default:
@@ -350,7 +351,7 @@ func (c *LinuxCgroup) AddThread(pid int, subsystems ...string) error {
 
 func (c *LinuxCgroup) Update(resources *specs.LinuxResources) error {
 	switch cg := c.cgroup.(type) {
-	case cgroups.Cgroup:
+	case cgroup1.Cgroup:
 		return cg.Update(resources)
 	case *cgroupsv2.Manager:
 		return cg.Update(cgroupsv2.ToResources(resources))
@@ -361,18 +362,18 @@ func (c *LinuxCgroup) Update(resources *specs.LinuxResources) error {
 
 func (c *LinuxCgroup) MoveTo(path string) error {
 	switch cg := c.cgroup.(type) {
-	case cgroups.Cgroup:
+	case cgroup1.Cgroup:
 		cgHierarchy, cgPath, err := cgroupHierarchy(path)
 		if err != nil {
 			return err
 		}
-		newCgroup, err := cgroups.Load(cgHierarchy, cgPath)
+		newCgroup, err := cgroup1.Load(cgPath, cgroup1.WithHierarchy(cgHierarchy))
 		if err != nil {
 			return err
 		}
 		return cg.MoveTo(newCgroup)
 	case *cgroupsv2.Manager:
-		newCgroup, err := cgroupsv2.LoadManager(unifiedMountpoint, path)
+		newCgroup, err := cgroupsv2.Load(path, cgroupsv2.WithMountpoint(unifiedMountpoint))
 		if err != nil {
 			return err
 		}
@@ -394,7 +395,7 @@ func (c *LinuxCgroup) AddDevice(deviceHostPath string) error {
 	c.devices = append(c.devices, deviceResource)
 
 	switch cg := c.cgroup.(type) {
-	case cgroups.Cgroup:
+	case cgroup1.Cgroup:
 		if err := cg.Update(&specs.LinuxResources{
 			Devices: c.devices,
 		}); err != nil {
@@ -431,7 +432,7 @@ func (c *LinuxCgroup) RemoveDevice(deviceHostPath string) error {
 	}
 
 	switch cg := c.cgroup.(type) {
-	case cgroups.Cgroup:
+	case cgroup1.Cgroup:
 		if err := cg.Update(&specs.LinuxResources{
 			Devices: c.devices,
 		}); err != nil {
@@ -473,7 +474,7 @@ func (c *LinuxCgroup) UpdateCpuSet(cpuset, memset string) error {
 	}
 
 	switch cg := c.cgroup.(type) {
-	case cgroups.Cgroup:
+	case cgroup1.Cgroup:
 		return cg.Update(&specs.LinuxResources{
 			CPU: c.cpusets,
 		})
