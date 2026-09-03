@@ -1,3 +1,5 @@
+// Copyright (c) 2026 Codewire, Inc.
+//
 // SPDX-License-Identifier: Apache-2.0
 
 //! Convert opted-in Kubernetes raw block devices into typed guest-confidential storage.
