@@ -33,6 +33,16 @@ FAIL = 1
 RUNNING = 127
 
 
+def latest_workflow_runs(workflow_runs):
+    """Return only the newest run for each workflow name."""
+    latest = {}
+    for run in workflow_runs:
+        previous = latest.get(run["name"])
+        if previous is None or run["id"] > previous["id"]:
+            latest[run["name"]] = run
+    return sorted(latest.values(), key=lambda run: run["id"])
+
+
 _GH_HEADERS = {"Accept": "application/vnd.github.v3+json"}
 if os.environ.get("GITHUB_TOKEN"):
     _GH_HEADERS["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
@@ -266,7 +276,7 @@ class Checker:
             _GH_RUNS_URL, "workflow_runs",
             f"check_workflow_runs_status_{attempt}",
             {"head_sha": self.latest_commit_sha})
-        for run in workflow_runs:
+        for run in latest_workflow_runs(workflow_runs):
             jobs = self.get_jobs_for_workflow_run(run["id"])
             for job in jobs:
                 self.record(run["name"], job)
