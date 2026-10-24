@@ -74,10 +74,10 @@ build_clh_from_source() {
 		git checkout "${cloud_hypervisor_version}"
 	fi
 
-	# Cloud Hypervisor v53 auto-detects the build backend from a device node.
+	# Cloud Hypervisor auto-detects the build backend from a device node.
 	# The kata-deploy build runs here inside a container, so the host device is
 	# not visible for that detection. Select KVM explicitly; the resulting
-	# x86_64 binary still includes every backend named by "features" below.
+	# binary still includes every backend named by "features" below.
 	local dev_cli_hypervisor="kvm"
 
 	# shellcheck disable=SC2154

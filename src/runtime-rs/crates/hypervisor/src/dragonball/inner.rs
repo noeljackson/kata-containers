@@ -14,7 +14,10 @@ use anyhow::{anyhow, Context, Result};
 use async_trait::async_trait;
 use dragonball::{
     api::v1::{BootSourceConfig, VcpuResizeInfo},
-    device_manager::{balloon_dev_mgr::BalloonDeviceConfigInfo, mem_dev_mgr::MemDeviceConfigInfo},
+    device_manager::{
+        balloon_dev_mgr::BalloonDeviceConfigInfo, mem_dev_mgr::MemDeviceConfigInfo,
+        rng_dev_mgr::RngDeviceConfigInfo,
+    },
     vm::VmConfigInfo,
 };
 
@@ -38,6 +41,10 @@ const DRAGONBALL_INITRD: &str = "initrd";
 const DRAGONBALL_ROOT_FS: &str = "rootfs";
 const BALLOON_DEVICE_ID: &str = "balloon0";
 const MEM_DEVICE_ID: &str = "memmr0";
+
+fn should_insert_host_rng(entropy_source: &str, confidential_guest: bool) -> bool {
+    !entropy_source.is_empty() && !confidential_guest
+}
 
 #[derive(Debug)]
 pub struct DragonballInner {
@@ -142,6 +149,35 @@ impl DragonballInner {
         self.set_vm_base_config().context("set vm base config")?;
         self.configure_boot_source()?;
 
+        // insert the virtio-rng device before boot: it is cold-plug only
+        let entropy_source = &self.config.machine_info.entropy_source;
+        let confidential_guest = self.config.security_info.confidential_guest;
+        if should_insert_host_rng(entropy_source, confidential_guest) {
+            // The VMM opens the entropy source while creating the devices and
+            // reports a failure there as a fatal boot error. Probe it first so
+            // that a source which is configured but not readable at runtime
+            // only costs the VM its virtio-rng device instead of preventing
+            // every container on the host from starting.
+            match std::fs::File::open(entropy_source) {
+                Ok(_) => {
+                    let rng_config = RngDeviceConfigInfo {
+                        src: entropy_source.clone(),
+                        use_shared_irq: None,
+                        use_generic_irq: None,
+                    };
+                    self.vmm_instance
+                        .insert_rng_device(rng_config)
+                        .context("insert rng device")?;
+                }
+                Err(e) => warn!(
+                    sl!(),
+                    "skip virtio-rng, entropy source {} is not readable: {}", entropy_source, e
+                ),
+            }
+        } else if confidential_guest && !entropy_source.is_empty() {
+            warn!(sl!(), "skip host-backed virtio-rng for confidential guest");
+        }
+
         // add pending devices
         while let Some(dev) = self.pending_devices.pop() {
             self.add_device(dev).await.context("add_device")?;
@@ -159,6 +195,12 @@ impl DragonballInner {
             return Ok(());
         }
 
+        let kernel_params = self.get_kernel_params()?;
+        self.set_boot_source(&kernel_params)
+            .context("set_boot_source")
+    }
+
+    fn get_kernel_params(&self) -> Result<String> {
         let mut kernel_params = KernelParams::new(self.config.debug_info.enable_debug);
 
         if self.config.boot_info.initrd.is_empty() {
@@ -176,6 +218,13 @@ impl DragonballInner {
         kernel_params.append(&mut KernelParams::from_string(
             &self.config.boot_info.kernel_params,
         ));
+        // A bare key still activates extensions that do not use dm-verity.
+        for extra in &self.config.guest_extension_images {
+            kernel_params.append(&mut KernelParams::from_string(&format!(
+                "kata.extension.{}.verity_params={}",
+                extra.name, extra.verity_params
+            )));
+        }
         if let Some(passfd_listener_port) = self.passfd_listener_port {
             kernel_params.append(&mut KernelParams::from_string(&format!(
                 "{PASSFD_LISTENER_PORT}={passfd_listener_port}"
@@ -183,12 +232,7 @@ impl DragonballInner {
         }
         info!(sl!(), "prepared kernel_params={:?}", kernel_params);
 
-        self.set_boot_source(
-            &kernel_params
-                .to_string()
-                .context("kernel params to string")?,
-        )
-        .context("set_boot_source")
+        kernel_params.to_string().context("kernel params to string")
     }
 
     pub(crate) fn run_vmm_server(&mut self) -> Result<()> {
@@ -258,7 +302,7 @@ impl DragonballInner {
     pub(crate) fn umount_jail_resource(&self, jailed_path: &str) -> Result<()> {
         let path = [self.jailer_root.as_str(), jailed_path].join("/");
         nix::mount::umount2(path.as_str(), nix::mount::MntFlags::MNT_DETACH)
-            .with_context(|| format!("umount path {}", &path))
+            .with_context(|| format!("umount path {}", path))
     }
 
     pub(crate) fn get_resource(&self, src: &str, dst: &str) -> Result<String> {
@@ -604,6 +648,48 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_guest_extension_kernel_params() {
+        use kata_types::config::hypervisor::GuestExtensionImage;
+
+        let (tx, _) = mpsc::channel(1);
+        let mut inner = DragonballInner::new(tx);
+        inner.config.boot_info.initrd = "/initrd.img".into();
+        inner.config.guest_extension_images = vec![
+            GuestExtensionImage {
+                name: "coco".into(),
+                path: "/coco.img".into(),
+                verity_params: "root_hash=abc,salt=def,data_blocks=1234".into(),
+            },
+            GuestExtensionImage {
+                name: "devkit".into(),
+                path: "/devkit.img".into(),
+                verity_params: String::new(),
+            },
+        ];
+        inner.passfd_listener_port = Some(1234);
+
+        // Exercise both initrd and image boot paths without starting a VMM.
+        for initrd in ["/initrd.img", ""] {
+            inner.config.boot_info.initrd = initrd.into();
+            inner.config.boot_info.rootfs_type = "erofs".into();
+            inner.config.blockdev_info.block_device_driver = crate::VM_ROOTFS_DRIVER_BLK.into();
+            let params = inner.get_kernel_params().unwrap();
+            let tokens: Vec<&str> = params.split_whitespace().collect();
+            assert!(tokens.contains(
+                &"kata.extension.coco.verity_params=root_hash=abc,salt=def,data_blocks=1234"
+            ));
+            assert!(tokens.contains(&"kata.extension.devkit.verity_params"));
+            assert!(tokens.contains(&format!("{PASSFD_LISTENER_PORT}=1234").as_str()));
+        }
+
+        inner.config.guest_extension_images.clear();
+        assert!(!inner
+            .get_kernel_params()
+            .unwrap()
+            .contains("kata.extension."));
+    }
+
+    #[test]
     fn test_template_restore_skips_boot_source_configuration() {
         let (tx, _) = mpsc::channel(1);
         let mut inner = DragonballInner::new(tx);
@@ -611,5 +697,12 @@ mod tests {
         inner.config.boot_info.kernel = "/kernel-must-not-be-opened".to_string();
 
         inner.configure_boot_source().unwrap();
+    }
+
+    #[test]
+    fn test_should_insert_host_rng() {
+        assert!(should_insert_host_rng("/dev/urandom", false));
+        assert!(!should_insert_host_rng("", false));
+        assert!(!should_insert_host_rng("/dev/urandom", true));
     }
 }

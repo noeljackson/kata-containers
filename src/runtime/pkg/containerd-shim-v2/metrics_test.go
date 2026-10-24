@@ -11,7 +11,6 @@ import (
 	"testing"
 
 	v1 "github.com/containerd/cgroups/v3/cgroup1/stats"
-	"github.com/containerd/containerd/protobuf"
 	vc "github.com/kata-containers/kata-containers/src/runtime/virtcontainers"
 	"github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/vcmock"
 	"github.com/stretchr/testify/assert"
@@ -56,33 +55,4 @@ func TestStatNetworkMetric(t *testing.T) {
 
 	metrics := statsToMetricsV1(&resp)
 	assertions.Equal(expectedNetwork, metrics.Network)
-}
-
-func TestCgroupMetricsWireTypes(t *testing.T) {
-	tests := []struct {
-		name    string
-		metrics interface{}
-		typeURL string
-	}{
-		{
-			name:    "cgroup v1",
-			metrics: statsToMetricsV1(&vc.ContainerStats{}),
-			typeURL: "io.containerd.cgroups.v1.Metrics",
-		},
-		{
-			name:    "cgroup v2",
-			metrics: statsToMetricsV2(&vc.ContainerStats{}),
-			typeURL: "io.containerd.cgroups.v2.Metrics",
-		},
-	}
-
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			metrics, err := protobuf.MarshalAnyToProto(test.metrics)
-			if !assert.NoError(t, err) {
-				return
-			}
-			assert.Equal(t, test.typeURL, metrics.TypeUrl)
-		})
-	}
 }

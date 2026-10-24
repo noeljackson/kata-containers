@@ -22,7 +22,7 @@ env:
 
 jobs:
   commit-message-check:
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       PR_AUTHOR: ${{ github.event.pull_request.user.login }}
@@ -46,7 +46,8 @@ jobs:
       env:
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
         PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        UPSTREAM_REF: main
+        # The deployment source is declared on an exact upstream release tag.
+        UPSTREAM_REF: refs/tags/4.3.1
         UPSTREAM_REPOSITORY: kata-containers/kata-containers
       run: |
         if [[ "$(git rev-parse HEAD)" != "${PR_HEAD_SHA}" ]]; then
@@ -70,7 +71,7 @@ jobs:
         git fetch --no-tags --no-recurse-submodules \
           "https://github.com/${UPSTREAM_REPOSITORY}.git" \
           "${UPSTREAM_REF}"
-        upstream_head="$(git rev-parse FETCH_HEAD)"
+        upstream_head="$(git rev-parse "FETCH_HEAD^{commit}")"
         upstream_base="$(git merge-base "${source_head}" "${upstream_head}")"
         if [[ "${upstream_base}" != "${upstream_head}" ]]; then
           echo "Source is not based on the current declared upstream head" >&2

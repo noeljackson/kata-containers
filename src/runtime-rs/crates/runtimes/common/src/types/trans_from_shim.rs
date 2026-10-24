@@ -66,6 +66,14 @@ fn trans_from_shim_mount(from: &api::Mount) -> Mount {
     }
 }
 
+fn dns_config_to_resolv_conf(dns_config: cri_api_v1::DNSConfig) -> Vec<String> {
+    format_dns_config(
+        &dns_config.servers,
+        &dns_config.searches,
+        &dns_config.options,
+    )
+}
+
 // There're a lot of information to create a sandbox from CreateSandboxRequest and the internal PodSandboxConfig.
 // At present, we only take out part of it to build SandboxConfig.
 impl TryFrom<sandbox_api::CreateSandboxRequest> for SandboxRequest {
@@ -80,14 +88,9 @@ impl TryFrom<sandbox_api::CreateSandboxRequest> for SandboxRequest {
 
         let dns = config
             .dns_config
-            .as_ref()
-            .map_or_else(Vec::new, |dns_config| {
-                format_dns_config(
-                    &dns_config.servers,
-                    &dns_config.searches,
-                    &dns_config.options,
-                )
-            });
+            .into_option()
+            .map(dns_config_to_resolv_conf)
+            .unwrap_or_default();
 
         Ok(SandboxRequest::CreateSandbox(Box::new(SandboxConfig {
             sandbox_id: from.sandbox_id.clone(),
@@ -338,10 +341,52 @@ impl TryFrom<api::ConnectRequest> for TaskRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::format_dns_config;
+    use super::*;
+
+    fn convert_create_sandbox_dns(dns_config: Option<cri_api_v1::DNSConfig>) -> Vec<String> {
+        let mut config = cri_api_v1::PodSandboxConfig::new();
+        config.dns_config = dns_config.into();
+
+        let mut options = protobuf::well_known_types::any::Any::new();
+        options.type_url = SANDBOX_API_V1.into();
+        options.value = config.write_to_bytes().unwrap();
+
+        let mut request = sandbox_api::CreateSandboxRequest::new();
+        request.options = protobuf::MessageField::some(options);
+
+        let request = SandboxRequest::try_from(request).unwrap();
+        let SandboxRequest::CreateSandbox(config) = request else {
+            panic!("expected create sandbox request");
+        };
+
+        config.dns
+    }
 
     fn strings(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| (*value).to_string()).collect()
+    }
+
+    #[test]
+    fn create_sandbox_formats_dns_config_as_resolv_conf() {
+        let mut dns_config = cri_api_v1::DNSConfig::new();
+        dns_config.servers = vec!["192.0.2.1".into(), "2001:db8::53".into()];
+        dns_config.searches = vec!["example.test".into(), "svc.example.test".into()];
+        dns_config.options = vec!["ndots:2".into(), "single-request-reopen".into()];
+
+        assert_eq!(
+            convert_create_sandbox_dns(Some(dns_config)),
+            [
+                "nameserver 192.0.2.1",
+                "nameserver 2001:db8::53",
+                "search example.test svc.example.test",
+                "options ndots:2 single-request-reopen",
+            ]
+        );
+    }
+
+    #[test]
+    fn create_sandbox_without_dns_config_has_empty_dns() {
+        assert!(convert_create_sandbox_dns(None).is_empty());
     }
 
     #[test]

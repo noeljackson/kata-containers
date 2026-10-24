@@ -22,6 +22,13 @@ HELM_DEFAULT_INSTALLATION="${HELM_DEFAULT_INSTALLATION:-false}"
 HELM_AGENT_HTTPS_PROXY="${HELM_AGENT_HTTPS_PROXY:-}"
 HELM_AGENT_NO_PROXY="${HELM_AGENT_NO_PROXY:-}"
 HELM_ALLOWED_HYPERVISOR_ANNOTATIONS="${HELM_ALLOWED_HYPERVISOR_ANNOTATIONS:-}"
+# Runtime annotations the suites set on their pods. Only the hypervisor ones a
+# configuration enables are forwarded by default, and these are not hypervisor
+# annotations, so containerd would drop them before the shim ever saw them.
+HELM_EXTRA_POD_ANNOTATIONS="${HELM_EXTRA_POD_ANNOTATIONS:-\
+io.katacontainers.config.runtime.create_container_timeout,\
+io.katacontainers.config.runtime.disable_guest_seccomp,\
+io.katacontainers.config.runtime.sandbox_cgroup_only}"
 HELM_CREATE_RUNTIME_CLASSES="${HELM_CREATE_RUNTIME_CLASSES:-}"
 HELM_CREATE_DEFAULT_RUNTIME_CLASS="${HELM_CREATE_DEFAULT_RUNTIME_CLASS:-}"
 HELM_DEBUG="${HELM_DEBUG:-}"
@@ -50,6 +57,37 @@ EROFS_MERGE_MODE="${EROFS_MERGE_MODE:-}"
 # jobs use.
 EROFS_UTILS_IMAGE="${EROFS_UTILS_IMAGE:-quay.io/kata-containers/erofs-utils:1.9.3}"
 
+helm_release_registered() {
+	helm status "${1}" -n "${2}" &>/dev/null
+}
+
+# `helm upgrade --install` installs only when there is no release at all; one
+# with no deployed revision takes the upgrade path, which refuses.
+helm_release_has_deployed_revision() {
+	helm history "${1}" -n "${2}" -o json 2>/dev/null |
+		jq -e 'any(.[]; .status == "deployed")' &>/dev/null
+}
+
+# A last resort: an uninstall re-runs the release's own pre-delete hooks, so a
+# release whose hooks cannot succeed is otherwise never removed. The nodes keep
+# whatever the install put on them.
+helm_purge_release() {
+	local release_name="${1}"
+	local namespace="${2}"
+
+	echo "Purging the '${release_name}' release with its hooks skipped" >&2
+	helm uninstall "${release_name}" -n "${namespace}" \
+		--ignore-not-found --no-hooks --wait --timeout 5m || true
+
+	helm_release_registered "${release_name}" "${namespace}" || return 0
+
+	# helm will not touch a release it cannot uninstall, and its storage for one
+	# is a Secret per revision.
+	echo "The '${release_name}' release outlived --no-hooks; deleting its storage" >&2
+	kubectl -n "${namespace}" delete secret \
+		-l "owner=helm,name=${release_name}" --ignore-not-found || true
+}
+
 # Wait for the Kubernetes API to recover after kata-deploy uninstall, then
 # retry the uninstall to purge any stale helm release state. On k3s/rke2,
 # the SIGTERM cleanup restarts the CRI runtime which takes down the API.
@@ -74,6 +112,47 @@ wait_for_api_and_retry_uninstall() {
 
 	helm uninstall "${release_name}" -n "${namespace}" \
 		--ignore-not-found --wait --timeout 5m || true
+
+	# A release left registered fails the next job, not this one.
+	if helm_release_registered "${release_name}" "${namespace}"; then
+		helm_purge_release "${release_name}" "${namespace}"
+	fi
+}
+
+# True when every node reports Ready. An unreachable API answers nothing, so
+# that counts as false here and leaves the caller to ask again.
+all_nodes_ready() {
+	local ready
+
+	ready="$(kubectl get nodes -o json --request-timeout=10s 2>/dev/null |
+		jq -r '.items[].status.conditions[] | select(.type == "Ready") | .status')" ||
+		return 1
+
+	[[ -n "${ready}" ]] || return 1
+
+	! grep -qv '^True$' <<< "${ready}"
+}
+
+# Wait for every node to report Ready, which after an uninstall means waiting
+# for the API to come back too.
+#
+# `kubectl wait` is a single watch and gives up when its connection breaks,
+# which is exactly what a control plane restarting under it does - and on
+# microk8s the control plane runs on the very containerd the SIGTERM cleanup
+# restarts. Polling makes an API that is still on its way back a retry rather
+# than a verdict.
+# Arguments:
+#   $1 - (Optional) seconds to wait, default 300
+wait_for_nodes_ready() {
+	local timeout="${1:-300}"
+
+	if waitForProcess "${timeout}" 5 all_nodes_ready; then
+		return 0
+	fi
+
+	echo "not every node became Ready within ${timeout}s" >&2
+	kubectl get nodes || true
+	return 1
 }
 
 function _print_instance_type() {
@@ -172,14 +251,19 @@ function create_cluster() {
 }
 
 function install_bats() {
+	local bats_version
+	if command -v bats &>/dev/null && bats_version=$(bats --version); then
+		echo "${bats_version}"
+		if version_greater_than_equal "${bats_version#Bats }" "1.10.0"; then
+			return
+		fi
+	fi
+
 	source /etc/os-release
 	case "${ID}" in
 		ubuntu)
-			# Only jammy and older need bats fetched from somewhere else:
-			# their own universe carries one too old for these suites,
-			# while noble onwards already ships a new enough bats. Pulling
-			# noble's repo into a later release would be reaching backwards.
-			if dpkg --compare-versions "${VERSION_ID:-}" lt 24.04; then
+			# Only use the noble repository on Ubuntu 24.04.
+			if [[ "${VERSION_ID:-}" == "24.04" ]]; then
 				# Installing bats from the noble repo.
 				sudo apt install -y software-properties-common
 				sudo add-apt-repository 'deb http://archive.ubuntu.com/ubuntu/ noble universe'
@@ -211,8 +295,7 @@ function delete_cluster() {
 	rg="$(_print_rg_name "${test_type}")"
 
 	if [[ "$(az group exists -g "${rg}")" == "true" ]]; then
-		az group delete -g "${rg}" --yes || \
-			warn "Failed to delete the resource group ${rg}"
+		az group delete -g "${rg}" --yes
 	fi
 }
 
@@ -226,20 +309,21 @@ function get_nodes_and_pods_info() {
 	kubectl get pods -o name | grep node-debugger | xargs kubectl delete || true
 }
 
+function setup_crio() {
+	local k0s_latest_url
+	k0s_latest_url=$(curl -sI -L -o /dev/null -w '%{url_effective}' https://github.com/k0sproject/k0s/releases/latest)
+	local k0s_version=${k0s_latest_url##*/}
+	local crio_version=${k0s_version%.*+*}
+	crio_version=${crio_version#v}
+
+	install_crio "${crio_version}"
+	overwrite_crio_config
+
+	install_cri_tools
+}
+
 function deploy_k0s() {
-	if [[ "${CONTAINER_RUNTIME}" == "crio" ]]; then
-		url=$(get_from_kata_deps ".externals.k0s.url")
-
-		k0s_version_param=""
-		version=$(get_from_kata_deps ".externals.k0s.version")
-		if [[ -n "${version}" ]]; then
-			k0s_version_param="K0S_VERSION=${version}"
-		fi
-
-		curl -sSLf "${url}" | sudo "${k0s_version_param}" sh
-	else
-		curl -sSLf -sSLf https://get.k0s.sh | sudo sh
-	fi
+	curl -sSLf https://get.k0s.sh | sudo sh
 
 	# In this case we explicitly want word splitting when calling k0s
 	# with extra parameters. For CI we set containerd=debug for kata-deploy and runtime debugging.
@@ -327,7 +411,7 @@ function create_cluster_kcli() {
 		-P ctlplanes="${CLUSTER_CONTROL_NODES:-1}" \
 		-P workers="${CLUSTER_WORKERS:-1}" \
 		-P network="${LIBVIRT_NETWORK:-default}" \
-		-P image="${CLUSTER_IMAGE:-ubuntu2204}" \
+		-P image="${CLUSTER_IMAGE:-ubuntu2404}" \
 		-P sdn=flannel \
 		-P nfs=false \
 		-P disk_size="${CLUSTER_DISK_SIZE:-20}" \
@@ -738,8 +822,11 @@ function helm_helper() {
 	# NFD is vendored under charts/*.tgz; no helm dependency fetch needed.
 
 	# Create temporary values file for customization
-	# Start with values.yaml which has all shims enabled by default
-	# Use example files only for specific hypervisor types that need different configurations
+	# Start with values.yaml, which enables the shims that need no particular
+	# snapshotter or hardware. The shims that do need one ship in a
+	# try-kata-*.values.yaml profile instead, so pick that as the base when the
+	# hypervisor under test is one of them - the profile is what sets up its
+	# snapshotter and CRI configuration.
 	values_yaml=$(mktemp -t values_yaml.XXXXXX)
 
 	# Determine which values file to use as base
@@ -763,6 +850,12 @@ function helm_helper() {
 				if is_confidential_runtime_class "${KATA_HYPERVISOR}"; then
 					if [[ -f "${helm_chart_dir}/try-kata-tee.values.yaml" ]]; then
 						base_values_file="${helm_chart_dir}/try-kata-tee.values.yaml"
+					fi
+				# Firecracker reads images from devmapper, and its profile is
+				# what maps the shim to that snapshotter.
+				elif is_firecracker_hypervisor "${KATA_HYPERVISOR}"; then
+					if [[ -f "${helm_chart_dir}/try-kata-fc.values.yaml" ]]; then
+						base_values_file="${helm_chart_dir}/try-kata-fc.values.yaml"
 					fi
 				fi
 				;;
@@ -853,6 +946,11 @@ function helm_helper() {
 				if is_se_hypervisor "${shim}"; then
 					yq -i ".shims.${shim}.supportedArches = [\"s390x\"]" "${values_yaml}"
 				elif is_snp_hypervisor "${shim}" || is_tdx_hypervisor "${shim}" || is_confidential_gpu_hypervisor "${shim}"; then
+					yq -i ".shims.${shim}.supportedArches = [\"amd64\"]" "${values_yaml}"
+				# Firecracker is built for amd64 only, which is what
+				# try-kata-fc.values.yaml says; without this the fallback
+				# below would widen it to every architecture.
+				elif is_firecracker_hypervisor "${shim}"; then
 					yq -i ".shims.${shim}.supportedArches = [\"amd64\"]" "${values_yaml}"
 				# qemu-coco-dev-runtime-rs is checked explicitly because
 				# qemu-coco-dev (Go runtime) does not support arm64.
@@ -1030,6 +1128,17 @@ function helm_helper() {
 							yq -i ".shims.${shim}.allowedHypervisorAnnotations += [\"${annotation}\"]" "${values_yaml}"
 						fi
 					done
+				fi
+			done
+		fi
+
+		if [[ -n "${HELM_EXTRA_POD_ANNOTATIONS}" ]]; then
+			yq -i '.containerd.extraPodAnnotations = []' "${values_yaml}"
+			IFS=',' read -ra extra_annotations <<< "${HELM_EXTRA_POD_ANNOTATIONS}"
+			for annotation in "${extra_annotations[@]}"; do
+				annotation=$(echo "${annotation}" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+				if [[ -n "${annotation}" ]]; then
+					yq -i ".containerd.extraPodAnnotations += [\"${annotation}\"]" "${values_yaml}"
 				fi
 			done
 		fi

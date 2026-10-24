@@ -17,6 +17,7 @@ RUN apk add --no-cache zstd
 
 COPY ${KATA_ARTIFACTS_DIR}/kata-static-*.tar.zst ${DESTINATION}/tarballs/
 COPY ${KATA_ARTIFACTS_DIR}/kata-deploy-static-*.tar.zst ${DESTINATION}/tarballs/
+COPY ${KATA_ARTIFACTS_DIR}/VERSION ${DESTINATION}/
 COPY tools/packaging/kata-deploy/shim-components.json ${DESTINATION}/
 COPY versions.yaml ${DESTINATION}/
 
@@ -95,6 +96,10 @@ COPY --from=artifact-stage /opt/prebuilt/usr/bin/kata-deploy /usr/bin/kata-deplo
 # Copy required libraries (assembled based on architecture)
 COPY --from=runtime-assembler /output/lib/ /lib/
 COPY --from=runtime-assembler /output/lib64/ /lib64/
+
+# Copy the SELinux policy module, as source CIL so the node's own secilc
+# compiles it and one file works across selinux-policy versions.
+COPY tools/packaging/kata-deploy/selinux/kata-deploy.cil ${DESTINATION}/selinux/
 
 # Copy nydus snapshotter
 COPY tools/packaging/kata-deploy/nydus-snapshotter ${DESTINATION}/nydus-snapshotter

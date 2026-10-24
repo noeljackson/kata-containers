@@ -14,24 +14,68 @@ helm show values --version X.Y.Z oci://ghcr.io/kata-containers/kata-deploy-chart
 
 ### shims
 
-Kata ships with a number of pre-built artifacts and runtimes. You may selectively enable or disable specific shims. For example:
+Each `shims` entry selects a runtime configuration exposed as a Kubernetes
+RuntimeClass. See the [kata-deploy RuntimeClass guide](kata-deploy-runtimeclasses.md#choosing-a-runtimeclass)
+for the purpose and prerequisites of every built-in class before selecting
+which configurations to enable.
 
+Kata ships a number of pre-built hypervisor artifacts, and the chart creates one
+`RuntimeClass` per **enabled** shim. Every shim `values.yaml` lists is enabled by
+default, and the file lists exactly those shims that run on an ordinary node —
+they read images through whatever snapshotter containerd already uses, and ask
+nothing of the host beyond hardware virtualization:
+
+- `qemu` and `qemu-runtime-rs` — QEMU (amd64, arm64, s390x, ppc64le)
+- `clh` and `clh-runtime-rs` — Cloud Hypervisor (amd64)
+- `clh-azure`, `clh-azure-runtime-rs` and `openvmm-azure-runtime-rs` — Microsoft
+  Hypervisor (mshv) hosts (amd64)
+- `dragonball` — Dragonball (amd64)
+
+So a default `helm install` gives you a set of RuntimeClasses that can all
+actually start a pod on a node of a supported architecture.
+
+!!! note "RuntimeClasses do not schedule by architecture"
+
+    A RuntimeClass is cluster-wide, and the scheduling constraint the chart puts
+    on it does not include the node's architecture. On a mixed-architecture
+    cluster an amd64-only class such as `kata-clh` or `kata-dragonball` is still
+    created, and a pod using it can be scheduled onto an arm64, s390x or ppc64le
+    node, where that handler was never installed. On such a cluster, add the
+    architecture to the class itself through the shim's
+    `runtimeClass.nodeSelector`, for example
+    `--set-string shims.clh.runtimeClass.nodeSelector.kubernetes\.io/arch=amd64`.
+
+!!! important "The hardware- and snapshotter-specific shims are not in `values.yaml`"
+
+    Confidential computing (SNP, TDX, IBM SE), NVIDIA, Firecracker and peer-pod
+    shims each come with a prerequisite the chart cannot satisfy on its own: a
+    particular containerd snapshotter (nydus, erofs, devmapper), a specific CPU, a
+    GPU, or a cloud provider running elsewhere. Enabled by default they would
+    create RuntimeClasses that look usable and fail the first pod scheduled onto
+    them, so each lives in a values file you opt into with `-f`, together with the
+    snapshotter setup and CRI configuration it needs.
+
+    Pick the one that matches your nodes from [Examples](#examples) below —
+    [`try-kata-tee.values.yaml`](#try-kata-teevaluesyaml),
+    [`try-kata-nvidia-gpu.values.yaml`](#try-kata-nvidia-gpuvaluesyaml),
+    [`try-kata-nvidia-cpu.values.yaml`](#try-kata-nvidia-cpuvaluesyaml),
+    [`try-kata-fc.values.yaml`](#try-kata-fcvaluesyaml) or
+    [`try-kata-remote.values.yaml`](#try-kata-remotevaluesyaml).
+
+You may selectively enable or disable specific shims. For example:
 ```yaml
 shims:
   disableAll: true
   qemu:
     enabled: true
-  qemu-nvidia-gpu:
-    enabled: true
-  qemu-nvidia-gpu-snp:
+  clh:
     enabled: false
-
 ```
 
 Shims can also have configuration options specific to them:
 
 ```yaml
-  qemu-nvidia-gpu:
+  qemu-runtime-rs:
     enabled: ~
     supportedArches:
       - amd64
@@ -42,16 +86,58 @@ Shims can also have configuration options specific to them:
     containerd:
       snapshotter: ""
     runtimeClass:
-      # This label is automatically added by gpu-operator. Override it
-      # if you want to use a different label.
-      # Uncomment once GPU Operator v26.3 is out
-      # nodeSelector:
-        # nvidia.com/cc.ready.state: "false"
+      nodeSelector:
+        example.io/feature: "true"
 ```
 
 The optional `shims.<shim>.dropIn` field lets you add a custom Kata drop-in for a
 default (non-custom) runtime. kata-deploy writes it as
 `config.d/50-user-overrides.toml` for that shim.
+
+!!! warning "`enabled: true` alone cannot bring back a shim that is not in `values.yaml`"
+
+    A shim is only considered for an architecture that its own `supportedArches`
+    lists, and a shim block that does not set the field matches none — so
+    `--set shims.qemu-tdx.enabled=true` on its own would install nothing, which the
+    chart rejects rather than leaving you a RuntimeClass no pod can run on. Use the
+    profile that carries the shim, or copy its whole block out of that profile,
+    which is also where its snapshotter and guest-pull settings live.
+
+### Containerd pod annotations
+
+kata-deploy builds each containerd runtime's `pod_annotations` allowlist from
+that runtime's effective Kata configuration. Only
+`io.katacontainers.config.hypervisor.*` annotations whose names occur in the
+runtime's `enable_annotations` list are forwarded. This includes entries
+enabled with `shims.<shim>.allowedHypervisorAnnotations` or a Kata
+configuration drop-in. Agent, runtime, and container-resource annotations are
+not forwarded unless listed below.
+
+Additional containerd annotation patterns can be enabled globally or for one
+shim:
+
+```yaml title="values.yaml"
+containerd:
+  extraPodAnnotations:
+    - sgx.intel.com/epc
+
+shims:
+  qemu:
+    containerd:
+      extraPodAnnotations:
+        - example.com/kata-*
+```
+
+Patterns use containerd's matching syntax.
+
+!!! warning
+    `containerd.extraPodAnnotations: ["io.katacontainers.*"]` restores the former,
+    unrestricted Kata annotation forwarding. That is a security risk: any Kata
+    annotation reaches the runtime.
+
+With `env.multiInstallSuffix`, each installation derives the allowlists from
+its own installed Kata configurations and applies them only to its own suffixed
+runtime handlers.
 
 It's best to reference the default `values.yaml` file above for more details.
 
@@ -61,9 +147,10 @@ The NVIDIA GPU images boot [NVRC](https://github.com/NVIDIA/nvrc) as their init
 process, which brings the NVIDIA stack up before the Kata agent starts. The
 `shims.<shim>.nvrc` block configures it. Every key becomes an `nvrc.*` guest
 kernel parameter, so it applies to all sandboxes on that shim and takes effect
-when a sandbox boots:
+when a sandbox boots. The GPU shims are not in `values.yaml`, so the block lives
+in the profile that carries them:
 
-```yaml title="values.yaml"
+```yaml title="try-kata-nvidia-gpu.values.yaml"
 shims:
   qemu-nvidia-gpu:
     nvrc:
@@ -159,6 +246,78 @@ found [here](runtime-configuration.md#drop-in-files).
 You can also use the `customRuntimes.runtimes.[name].dropIn` configuration in the helm
 chart to achieve the same results.
 
+### `shims.<shim>.hypervisor.rootless`
+
+Runs a shim's VMM as a throwaway unprivileged user per sandbox, instead of
+`root`:
+
+```yaml title="values.yaml"
+shims:
+  qemu-runtime-rs:
+    hypervisor:
+      rootless: true
+```
+
+Only the **runtime-rs QEMU** shims and `clh-runtime-rs` run their VMM
+unprivileged, so only they accept it: `qemu-runtime-rs` and its variants, plus
+`clh-runtime-rs`. Asking for it on any other shim
+fails the install. Everything outside the VMM — the shim, `virtiofsd`, the guest
+— is unaffected either way.
+
+Enabling it turns `rootless = true` on for that shim *and* provisions the host
+device access an unprivileged VMM needs, because neither half is any use without
+the other:
+
+| Device | Group | Needed by |
+| --- | --- | --- |
+| `/dev/kvm` | `kvm` | every VMM |
+| `/dev/sev` | `kata-sev` | AMD SEV-SNP, when an SNP shim is rootless |
+| `/dev/uv` | `kata-se` | IBM Secure Execution, when `qemu-se-runtime-rs` is rootless |
+
+Each shim asks only for what it needs, so a node running an SNP shim privileged
+alongside a rootless `qemu-runtime-rs` never gets the `kata-sev` group.
+
+Each device gets group read/write, recorded as a udev rule under
+`/etc/udev/rules.d` so it outlives a reboot or the device being re-created.
+Uninstall removes the rule, as does the next install once no shim asks for
+rootless. The TEE devices deliberately do not join `kvm`, so a
+plain rootless sandbox cannot reach the SEV or ultravisor platform interface just
+because it needs KVM, and the groups are created empty, so no existing user gains
+anything.
+
+A device the node does not have is skipped, and one that already grants
+unprivileged access is left exactly as the node has it, recorded in the rule only
+when it already has the rule's group and mode.
+
+Only devices the VMM opens by path are provisioned, which is why
+`/dev/vhost-vsock` and `/dev/vhost-net` are absent: the shim opens them as `root`
+and passes the descriptors to the VMM, so the VMM user needs no access to them.
+
+!!! warning "Requires udev on the node"
+
+    Reboot persistence relies on the node running a udev implementation that
+    reads `/etc/udev/rules.d` (`systemd-udevd` or eudev) and keeping `/etc`
+    across reboots — true of every supported `k8sDistribution`. A node using
+    busybox `mdev`, or an image that rebuilds `/etc` at boot such as
+    Bottlerocket, accepts the file and never acts on it. The devices are still
+    reconciled, so sandboxes run until the next reboot, but the permissions do
+    not stick. See
+    [How to run a rootless VMM](how-to/how-to-run-rootless-vmm.md) for what to do
+    on those hosts.
+
+!!! warning "Requires `deploymentMode: job`"
+
+    The DaemonSet does its host work from a single unprivileged container with no
+    host root, so it cannot create the groups or reconcile the device nodes. The
+    chart refuses a rootless shim in that mode rather than configuring sandboxes
+    that could not start. `job` is the default mode.
+
+Intel TDX needs nothing here when its quote generation service is reached over
+AF_VSOCK, which is the supported path. A deployment that points the shim at a
+QGS Unix socket has to grant the VMM user write access to it separately; see
+[How to run a rootless VMM](how-to/how-to-run-rootless-vmm.md) for that and for
+the full host access contract.
+
 ### k8sDistribution
 
 Different Kubernetes distributions keep containerd's configuration in different
@@ -182,6 +341,62 @@ containerd matches none of the presets.
     nothing to show for it. The install compares the two and stops before writing
     anything, naming the value to set. An explicit `containerd.configDir` overrides
     the derivation this check is about, so it does not apply in that case.
+
+The value carries one thing beyond that directory: where the kubelet keeps its root
+directory. A pod's `ConfigMap`, `Secret`, projected and downward-API volumes are
+written under it, and the Go runtime watches that path so later updates to them
+reach the running guest; the kubelet's Pod Resources API socket sits under it too,
+which both runtimes read to learn the GPUs a pod was allocated before cold-plugging
+them. `k0s` uses `/var/lib/k0s/kubelet` and `microk8s`
+`/var/snap/microk8s/common/var/lib/kubelet`; `k3s`, `rke2` and vanilla Kubernetes
+leave the kubelet's own `/var/lib/kubelet` alone and need nothing.
+
+!!! note "The kubelet is not the CRI runtime"
+
+    Unlike the containerd directory, this cannot be worked out on the node: a `k0s`
+    node running CRI-O or a containerd of its own still keeps its volumes under
+    `/var/lib/k0s`. So declare the flavour even when you pin
+    `containerd.configDir` — that pin takes only the check above out of the way.
+    The volume watch is the Go runtime's alone, runtime-rs recognising those volumes
+    by the shape of their paths wherever the kubelet root is, but the socket is read
+    by both. Getting either wrong is quiet: volume updates stop arriving, and GPU
+    cold plug falls back to CDI annotations.
+
+!!! warning "Only default installations are supported"
+
+    The install finds the node's CRI runtime by probing the systemd units each
+    distribution is known by, and restarts that unit, waits on it for readiness,
+    and hangs the snapshotter's service dependency off it:
+
+    | Distribution | Units probed                             |
+    | ------------ | ---------------------------------------- |
+    | K3s          | `k3s`, `k3s-agent`                       |
+    | RKE2         | `rke2-server`, `rke2-agent`              |
+    | k0s          | `k0scontroller`, `k0sworker`             |
+    | MicroK8s     | `snap.microk8s.daemon-containerd`        |
+
+    A node running one of these under any other unit name, under another init
+    system, or with its containerd configuration somewhere other than the
+    location that distribution installs it in, is not supported. Nothing detects
+    it, and `k8sDistribution` cannot make up the difference: it says which
+    configuration layout to write, never which unit to act on.
+
+    K3s is the easiest to get into this state. Its installer accepts
+    [`INSTALL_K3S_NAME`, `INSTALL_K3S_SYSTEMD_DIR` and
+    `INSTALL_K3S_TYPE`](https://docs.k3s.io/reference/env-variables), and can
+    install under openrc rather than systemd, so leave those unset.
+
+!!! warning "erofs and nydus require a node that has not used them before"
+
+    kata-deploy writes erofs and nydus settings into containerd's configuration.
+    Those settings — dm-verity mode, the merged-layer layout, the nydus proxy root —
+    have to match what existing layers were built to, or containerd can no longer
+    mount them.
+
+    Changing them on a node that has already pulled images under a different erofs or
+    nydus configuration breaks those layers. Deploy kata-deploy with erofs or nydus
+    **only on nodes where neither snapshotter has been used before**, and leave
+    `snapshotter.setup` empty on nodes that already have one of them configured.
 
 ### nodeBinaries
 
@@ -258,7 +473,12 @@ fails the render rather than deploying something that cannot work.
 ## Deployment Modes (DaemonSet vs Job)
 
 The chart can install Kata on nodes in one of two ways, selected with the
-top-level `deploymentMode` value:
+top-level `deploymentMode` value.
+
+Both modes install all enabled runtimes and their RuntimeClasses, including
+the TEE, NVIDIA, Firecracker and remote configurations supplied by profiles,
+subject to their supported architectures. Choosing a mode does not change the
+runtime selection; it changes how kata-deploy prepares and manages the nodes.
 
 - **`daemonset`**: the long-running `kata-deploy` DaemonSet installs
   Kata on every matching node and reverts it when the pod is terminated (i.e. on
@@ -273,6 +493,9 @@ top-level `deploymentMode` value:
   ```text
   host-check -> artifacts   (initContainers)  ->  cri (main)
   ```
+
+  With [`selinux.enabled`](#selinux), one more privileged one-shot container runs
+  ahead of all of them to load the policy the confined stages ask for.
 
   On `helm uninstall`, a `pre-delete` dispatcher fans out per-node Jobs that run
   the pipeline in reverse (`revert-cri -> remove-artifacts`). Unlike
@@ -301,6 +524,38 @@ behavior:
     deploymentMode: daemonset
     ```
 
+The main tradeoffs are:
+
+| | `job` | `daemonset` |
+| --- | --- | --- |
+| After installation | Per-node Jobs exit, freeing their pod resources; privileged host work carries no API token. | A kata-deploy pod and its API token remain on every selected node for the life of the release. |
+| New matching nodes | Require a [Helm upgrade or scheduled reconciliation](#adding-nodes-in-job-mode). | The DaemonSet automatically places an installer pod on each new matching node. |
+| Additional node preparation | The staged pipeline can install host binaries through [`nodeBinaries`](#nodebinaries) and provision [rootless VMM access](#shimsshimhypervisorrootless). | Install required host binaries yourself before deploying; `nodeBinaries` and the chart's rootless option require Job mode. |
+
+!!! important "`job` mode installs Kata on the nodes in the cluster when the release is applied"
+
+    The `job` deployment installs Kata on the nodes that are part of the cluster
+    when `helm install` or `helm upgrade` runs. A node that joins the cluster
+    afterwards, whether it replaces an existing node or is added by scaling up,
+    needs special handling to get Kata installed: nothing installs it until the
+    release is applied again, or a [scheduled reconcile](#doing-it-on-a-schedule-instead)
+    picks it up. Until then it does not carry the `katacontainers.io/kata-runtime`
+    label, so pods asking for a Kata RuntimeClass are not scheduled onto it. See
+    [Adding nodes in `job` mode](#adding-nodes-in-job-mode).
+
+    `daemonset` mode has no such gap: the DaemonSet places an installer pod on
+    every matching node as it joins. The price is in permissions: that pod is
+    privileged, carries the `kata-deploy` ServiceAccount token, which can patch
+    any node in the cluster, and stays on every node Kata runs on for the life
+    of the release. Root on any of those nodes can read that token. In `job`
+    mode the privileged pods carry no token and exit once the node is installed;
+    see [Where the credentials live](#where-the-credentials-live).
+
+The runtime prerequisites still apply in either mode: selecting a profile does
+not provide missing hardware, firmware, GPU passthrough setup or external
+services. See the [RuntimeClass guide](kata-deploy-runtimeclasses.md#default-installation-and-opt-in-profiles)
+for the requirements of each profile.
+
 !!! warning "Upgrading a release installed before `job` became the default"
     `deploymentMode` is [immutable for the life of a release](#how-installations-keep-out-of-each-others-way-on-a-node),
     so an existing `daemonset` release does not silently move to per-node Jobs:
@@ -316,7 +571,7 @@ of any pod running there.
 
 | | runs where | privileged on the host | API rights |
 |---|---|---|---|
-| dispatcher (install, uninstall, and each scheduled reconcile) | one pod, only where you let it schedule ([Where the dispatcher runs](#where-the-dispatcher-runs)) | no | `nodes: list, get, patch`; Jobs in the release namespace; `nodes/proxy: get` only when guest pull or image conversion is configured; `pods: get` and `cronjobs: get, delete` only with [`job.reconcile`](#doing-it-on-a-schedule-instead) enabled |
+| dispatcher (install, uninstall, and each scheduled reconcile) | one pod, only where you let it schedule ([Where the dispatcher runs](#where-the-dispatcher-runs)) | no | `nodes: list, get, patch`; `jobs: create, get, list, delete` and `pods: list` in the release namespace; `events: create` in `default`, which is the only namespace an Event about a Node can live in; `nodes/proxy: get` only when guest pull or image conversion is configured; `pods: get`, `cronjobs: get, list, watch, delete` and `watch` added to `jobs` only with [`job.reconcile`](#doing-it-on-a-schedule-instead) enabled, because the uninstall hook waits out the deletions it makes and a waited delete is served from an informer |
 | per-node Jobs | every node Kata is installed on | yes | **none — no token is mounted** |
 | `post-delete` hook (uninstall only) | one pod, wherever it schedules | no | `delete` on ClusterRoles, ClusterRoleBindings, Roles, RoleBindings and ServiceAccounts |
 | verification Job (only if `verification.pod` is set) | one pod, wherever it schedules | no | pods and pod logs (`create`, `delete`, `get`, `list`, `watch`), `nodes`/`events`/`daemonsets`/`jobs`: `get`, `list` |
@@ -476,6 +731,14 @@ helm upgrade kata-deploy "${CHART}" --version "${VERSION}" --reuse-values
 Each per-node stage is idempotent (it skips when already applied), so the
 upgrade only does real work on the newly added nodes.
 
+!!! tip "Let your cluster lifecycle tooling re-apply the release"
+
+    Prefer Flux, Argo CD, or another cluster lifecycle layer to re-apply the
+    release when nodes change, for example as part of the same change that grows
+    a node pool or rolls nodes onto a new image. kata-deploy's installation steps
+    are idempotent, so rerunning them is expected and safe: nodes that are already
+    installed finish quickly with nothing to do, and only the new ones get real work.
+
 #### Doing it on a schedule instead
 
 On a fleet that grows on its own — an autoscaler, or nodes joining faster than
@@ -510,6 +773,27 @@ than being retried immediately — the next tick is the retry.
     node falling out is usually a label gone wrong somewhere, and taking a host
     apart on a timer with nobody watching is the worse of the two outcomes. Removals
     stay with the upgrade you run yourself.
+
+!!! note "A joining node waits for the next tick"
+
+    The schedule sets how long a new node goes without Kata. With
+    `*/15 * * * *`, a node can wait up to fifteen minutes, plus its own install,
+    before it is labelled and Kata pods are scheduled onto it, and pods asking for
+    a Kata RuntimeClass stay `Pending` in the meantime. Choose the interval based on
+    how long your workloads can wait. A tick over a settled fleet only lists the
+    nodes and exits, so a shorter interval costs little.
+
+!!! note "It covers new nodes, not changes to nodes it has already installed"
+
+    A tick decides what to do from what the install recorded on each Node object,
+    and it skips nodes that already show a finished install. A node replaced in
+    place is one of those: rebuilt, but re-registering under the same Node object
+    and keeping its labels, it looks installed to the tick even though the host
+    has nothing on it. Changing the release's values likewise needs a
+    `helm upgrade`. Re-applying the release from your lifecycle tooling covers both
+    cases, because every per-node stage then checks the host itself. Treat the
+    schedule as a safety net for nodes joining between those runs, not as a
+    replacement for them.
 
 !!! warning "Off by default"
 
@@ -560,6 +844,99 @@ The `before-hook-creation` delete policy first removes the stale dispatcher Job
 re-enumerates nodes live, recreates the per-node Jobs (adopting any that still
 exist rather than duplicating them), and because every stage is idempotent the
 already-installed nodes are fast no-ops. Coverage converges on the re-run.
+
+### Finding out why a node failed
+
+A rollout that fails says which nodes failed and what stopped each of them in
+three places, as long as the dispatcher lived long enough to say so. Helm prints
+its summary directly, and the node Event and annotation remain available after
+the command exits.
+
+=== "From `helm`"
+    The chart asks Helm to print the dispatcher's log when the hook fails, and
+    the dispatcher ends that log with one line per failed node, so the command
+    that failed is also the one that explains it:
+
+    ```text title="$ helm install kata-deploy ..."
+    level=INFO msg="[2026-09-03T18:22:11Z INFO ] fanning out 2 per-node Job(s) with parallelism 1\n...
+    Error: 2 node(s) failed:\n  worker-2: its job kata-deploy-install-worker-2 failed:
+    load-kernel-modules exited 1: this node has no usable virtualization backend: neither
+    /dev/kvm nor /dev/mshv is present [BackoffLimitExceeded: Job has reached the specified
+    backoff limit]\n  worker-5: its job kata-deploy-install-worker-5 failed: cri never
+    started: ImagePullBackOff: Back-off pulling image \"kata-deploy:bad-tag\"\n"
+    Error: INSTALLATION FAILED: failed post-install: resource Job/kube-system/kata-deploy-install-dispatcher not ready. status: Failed, message: Job Failed. failed: 1/1
+    ```
+
+    !!! warning "Helm prints hook logs as a single escaped line"
+        Helm writes hook output through its structured logger, so the whole log
+        arrives as one `level=INFO msg="..."` record with newlines escaped to `\n`.
+        Helm's own closing `Error:` line says only that the hook Job failed — the
+        reason is inside that record. The dispatcher keeps its output short so the
+        record stays readable, and `sed` gives it back its newlines:
+
+        ```sh
+        helm install kata-deploy "${CHART}" 2>&1 | sed -e 's/\\n/\n/g' -e 's/\\"/"/g'
+        ```
+
+        Nothing is lost either way: the same reason is on the node, in the two
+        forms below, after the command has scrolled away.
+
+=== "From the node"
+    The same reason is recorded as an Event against the `Node`, so it turns up in
+    `kubectl describe node` and in whatever already collects events from the
+    cluster:
+
+    ```text title="$ kubectl describe node worker-2"
+    Events:
+      Type     Reason     Age   From                Message
+      ----     ------     ----  ----                -------
+      Warning  JobFailed  2m    kata-deploy-job-dispatcher  its job kata-deploy-install-worker-2
+                                failed: load-kernel-modules exited 1: this node has no
+                                usable virtualization backend
+    ```
+
+    Listing them directly needs the `default` namespace rather than the release's:
+    a `Node` has no namespace, and that is the only one the API server accepts an
+    Event about a cluster-scoped object in — the same place the kubelet's own
+    node events go.
+
+    ```sh
+    kubectl get events -n default --field-selector involvedObject.kind=Node
+    ```
+
+=== "Afterwards"
+    Events expire, so the result is also written to the node itself and stays
+    until the next rollout overwrites it:
+
+    ```sh title="$ kubectl get nodes -l kata-deploy-job-dispatcher/result=failed"
+    NAME       STATUS   ROLES    AGE   VERSION
+    worker-2   Ready    <none>   9d    v1.34.1
+    ```
+
+    ```sh title="$ kubectl get node worker-2 -o jsonpath='{.metadata.annotations}'"
+    kata-deploy-job-dispatcher/error:       its job kata-deploy-install-worker-2 failed: ...
+    kata-deploy-job-dispatcher/finished-at: 2026-09-03T18:22:41Z
+    ```
+
+What makes any of that possible is that each stage writes why it is giving up to
+`/dev/termination-log`, which lands in the pod's status rather than only in its
+log. The dispatcher reads it the moment a Job is judged, and passes it on. The
+dispatcher's own pod keeps the same summary in its status as a fallback for the
+three places above: a dispatcher killed before it could report anything is
+explained by `kubectl describe pod` alone.
+
+!!! tip "A node that is stuck, rather than failed"
+    Nothing marks a Job whose pod cannot be scheduled or cannot pull its image:
+    it stays *running* until `job.activeDeadlineSeconds` expires, which is an
+    hour on the defaults. Two minutes in, and every five after that, the
+    dispatcher says what the wait is for — as a log line and as a
+    `Warning`/`JobPending` Event on the node.
+
+!!! note "Where the log still helps"
+    The summary carries one line per node. The per-node Job's own log carries
+    everything the stage printed on the way there, and `job.ttlSecondsAfterFinished`
+    (10 minutes by default) is how long you have to read it. Raise it on a cluster
+    where nobody is watching the rollout live.
 
 ### Choosing which nodes get a Job
 
@@ -807,9 +1184,138 @@ See the default [`values.yaml`](#parameters) for the remaining `job.*` options
 (e.g. `dispatcherImage`, `parallelism`, `ttlSecondsAfterFinished`,
 `backoffLimit`).
 
+## SELinux
+
+The install stages run unprivileged, which on an SELinux-enforcing node means they
+run as `container_t` — a domain that is denied the host work they exist to do.
+Writing `/opt/kata`, writing the CRI drop-in and driving systemd are all refused,
+and the install fails with `AVC` denials in the node's audit log.
+
+`selinux.enabled` fixes that without giving the privilege back:
+
+```yaml title="values.yaml"
+selinux:
+  enabled: true
+```
+
+This loads a Kata-owned policy module on each node and runs each stage in a
+least-privilege domain of its own. It works in both deployment modes.
+
+| domain | used by | may |
+|---|---|---|
+| `kata_deploy_check_t` | `host-check` | read only, plus ask systemd whether the CRI is running |
+| `kata_deploy_artifacts_t` | `artifacts`, `remove-artifacts` | write `/opt/kata`, the snapshotter unit, `/etc/modules-load.d` |
+| `kata_deploy_cri_t` | `cri`, `revert-cri` | write the CRI configuration, manage the snapshotter unit, restart the CRI |
+| `kata_deploy_node_binaries_t` | `node-binaries-install`, `node-binaries-remove` | write `/usr/local/bin` |
+| `kata_deploy_t` | the DaemonSet's single container | all of the above except `/usr/local/bin` |
+
+`job` mode runs each stage in its own container, so each gets the narrowest domain
+its own work needs: `artifacts` cannot reach the CRI configuration, and neither it
+nor `cri` can touch `/usr/local/bin`. `cri` does reach `/opt/kata`, because
+`revert-cri` takes the nydus binaries back out of it. `daemonset` mode runs the
+whole install in one container, so it needs the union — minus
+`kata_deploy_node_binaries_t`, since [`nodeBinaries`](#nodebinaries) requires
+`job` mode.
+
+The containers that stage [`nodeBinaries`](#nodebinaries) get no domain of their
+own. They are the only ones running images Kata does not build, and they write
+nothing but a pod-local `emptyDir`, so plain `container_t` is both enough for them
+and the right blast radius.
+
+!!! note "Enabling it on a cluster that is not entirely SELinux"
+    Nodes with SELinux disabled are unaffected: the policy stage exits without
+    doing anything, and the runtime ignores the requested domains. So the value is
+    safe to set once for a mixed cluster rather than per node pool.
+
+### What it needs, and what it changes on the node
+
+Loading a policy module is itself privileged, so the chart adds one privileged
+one-shot container, `selinux-policy`, that runs the node's own `semodule`. It is
+first in the pipeline and exits before any confined stage starts, which is what buys
+every host-working stage after it staying unprivileged. It runs in the cleanup
+pipeline too, because those stages are confined as well and a node whose module went
+missing could otherwise never be uninstalled.
+
+It is not the only privileged container in `job` mode: `load-kernel-modules` was
+already one, and stays one. In `daemonset` mode it is the only one.
+
+The nodes need `policycoreutils` (for `semodule`) installed, unless their policy
+already defines the domains — the stage checks before it complains, so a node whose
+policy is managed elsewhere needs nothing from Kata. The module is shipped as source
+CIL and compiled by the node's own `secilc` at load time, so one artifact works
+across `selinux-policy` versions and distributions.
+
+Nothing is relabelled. The module defines no `filecon` rules, so `/opt/kata` keeps
+the labels it has today (`usr_t`, inherited from `/opt`) and the Kata *runtime* sees
+exactly what it saw before. The scope is the installer only.
+
+!!! note "Moving the install directory or the CRI configuration"
+    `env.installationPrefix` and `containerd.configDir` can put either directory
+    anywhere on the node, where it carries a label the shipped module knows nothing
+    about. So the stage reads the label each one actually has and, when it is not one
+    the module already grants, loads a one-line module of its own —
+    `kata-deploy-install-<type>`, `kata-deploy-cri-config-<type>` — adding that type
+    to the rules. Still no relabelling: the node's labels decide, not Kata.
+
+### Several releases on one node
+
+The policy store is the node's, not the release's, so every kata-deploy on a node
+shares one module. It is installed at a priority carrying the policy's own revision,
+and `semodule` keeps the highest, so an older image installing or uninstalling its
+own release cannot take a newer release's rules away.
+
+That priority is also what removal has to name:
+
+```bash
+semodule --list-modules=full | grep kata-deploy
+semodule -X <priority> -r kata-deploy
+```
+
+!!! warning "The module is left loaded on uninstall"
+    This matches how host kernel modules are already handled: `helm uninstall`
+    drops the `modules-load.d` file but never unloads a module. Remove the modules
+    listed above by hand once no release on the node needs them.
+
+Off by default, because it mutates the node's policy store — something a cluster
+that manages its own SELinux policy may prefer to do itself. The module is at
+[`tools/packaging/kata-deploy/selinux/kata-deploy.cil`](https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/selinux/kata-deploy.cil).
+
 ## Examples
 
-We provide a few examples that you can pass to helm via the `-f`/`--values` flag.
+The shims that need a specific containerd snapshotter or specific hardware are
+deliberately absent from `values.yaml` (see [shims](#shims)). Each of them ships
+instead as a ready-made values file — a *profile* — that you pass to helm with
+`-f`/`--values`, and that brings along the snapshotter setup, CRI settings and
+`defaultShim` its shims need.
+
+All profiles default to `job` mode and can install their runtimes using either
+deployment mode. To use a DaemonSet for a new release, pass
+`--set deploymentMode=daemonset` after the profile's `-f` argument. Prepare the
+required host binaries first (for EROFS, `mkfs.erofs` from `erofs-utils` 1.8.2 or
+newer), and leave `nodeBinaries` empty. The optional `nodeBinaries` block in the
+NVIDIA profiles requires Job mode. See [nodeBinaries](#nodebinaries) and
+[Deployment Modes](#deployment-modes-daemonset-vs-job) for the preparation and
+lifecycle differences.
+
+The profiles are packaged with the chart, so you can get a copy to read and edit
+without cloning the repository:
+
+```sh
+helm pull oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
+  --version VERSION --untar
+ls kata-deploy/try-kata-*.values.yaml
+```
+
+!!! warning "Pick the profile that matches your nodes — don't stack two"
+
+    A profile is a complete values file, not a fragment: it starts from
+    `shims.disableAll: true`, enables its own shims, and sets its own
+    `snapshotter.setup`. Passing two of them lets the later `-f` win key by key,
+    which leaves a mixture neither profile describes — quite possibly shims mapped
+    to a snapshotter that was never set up. To serve genuinely different node
+    pools from one cluster, install one release per pool, each with its own
+    `nodeSelector` and `env.multiInstallSuffix` (see
+    [Multiple Kata installations on the Same Node](#multiple-kata-installations-on-the-same-node)).
 
 Each is published as a release asset and `-f` takes a URL, so helm fetches the
 file itself. Replace `VERSION` in both the flag and the URL, or use
@@ -822,7 +1328,8 @@ file itself. Replace `VERSION` in both the flag and the URL, or use
 
 ### [`try-kata-tee.values.yaml`](https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/helm-chart/kata-deploy/try-kata-tee.values.yaml)
 
-This file enables only the TEE (Trusted Execution Environment) shims for confidential computing:
+Confidential computing: the TEE (Trusted Execution Environment) shims, with the
+nydus snapshotter and guest pull they need to keep the image off the host.
 
 ```sh
 helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
@@ -832,18 +1339,24 @@ helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-d
 
 Includes:
 
-- `qemu-snp` - AMD SEV-SNP (amd64)
-- `qemu-tdx` - Intel TDX (amd64)
-- `qemu-se` - IBM Secure Execution for Linux (SEL) (s390x)
-- `qemu-se-runtime-rs` - IBM Secure Execution for Linux (SEL) Rust runtime (s390x)
+- `qemu-snp` and `qemu-snp-runtime-rs` - AMD SEV-SNP (amd64)
+- `qemu-tdx` and `qemu-tdx-runtime-rs` - Intel TDX (amd64)
+- `qemu-se` and `qemu-se-runtime-rs` - IBM Secure Execution for Linux (SEL) (s390x)
 - `qemu-coco-dev` - Confidential Containers development (amd64, s390x)
 - `qemu-coco-dev-runtime-rs` - Confidential Containers development Rust runtime (amd64, arm64, s390x)
 
+The TEE RuntimeClasses also take part in
+[TEE key advertisement](#tee-key-advertisement) and get
+[NFD-based node selectors](#runtimeclass-node-selectors-for-tee-shims) when NFD is
+around, so confidential pods are only scheduled where the hardware is.
+
 ### [`try-kata-nvidia-cpu.values.yaml`](https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/helm-chart/kata-deploy/try-kata-nvidia-cpu.values.yaml)
 
-This file enables only the NVIDIA CPU-only shims and installs them using the
+The NVIDIA CPU-only shims: the NVIDIA guest userspace without GPU passthrough.
+They run with `shared_fs=none`, so the profile sets up the erofs snapshotter with
+memory-backed rw layers and dm-verity, and installs using the
 [`job` deployment mode](#deployment-modes-daemonset-vs-job) (no always-on
-DaemonSet on the node):
+DaemonSet on the node).
 
 ```sh
 helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
@@ -857,11 +1370,19 @@ Includes:
 - `qemu-nvidia-cpu-runtime-rs` - NVIDIA base image without GPU passthrough,
   using the Rust runtime (amd64, arm64)
 
+!!! info "erofs needs containerd 2.2.0 or newer"
+    The erofs snapshotter is containerd's own, and the profile configures it
+    through the auto-imported `conf.d` drop-in mechanism. Both arrived in
+    containerd 2.2.0, which is the minimum kata-deploy enforces for erofs.
+
 ### [`try-kata-nvidia-gpu.values.yaml`](https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/helm-chart/kata-deploy/try-kata-nvidia-gpu.values.yaml)
 
-This file enables only the NVIDIA GPU-enabled shims and installs them using the
-[`job` deployment mode](#deployment-modes-daemonset-vs-job) (no always-on
-DaemonSet on the node):
+The NVIDIA GPU shims, including their confidential variants. The profile defaults
+to [`job` deployment mode](#deployment-modes-daemonset-vs-job); all six runtimes
+can also be installed with `daemonset`, with the node preparation described
+[above](#examples). It sets up both
+snapshotters the shim set needs: erofs for the plain GPU handlers, nydus for the
+TEE ones.
 
 ```sh
 helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
@@ -871,9 +1392,61 @@ helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-d
 
 Includes:
 
-- `qemu-nvidia-gpu` - Standard NVIDIA GPU support (amd64)
-- `qemu-nvidia-gpu-snp` - NVIDIA GPU with AMD SEV-SNP (amd64)
-- `qemu-nvidia-gpu-tdx` - NVIDIA GPU with Intel TDX (amd64)
+- `qemu-nvidia-gpu` and `qemu-nvidia-gpu-runtime-rs` - GPU passthrough (amd64)
+- `qemu-nvidia-gpu-snp` and `qemu-nvidia-gpu-snp-runtime-rs` - GPU with AMD SEV-SNP (amd64)
+- `qemu-nvidia-gpu-tdx` and `qemu-nvidia-gpu-tdx-runtime-rs` - GPU with Intel TDX (amd64)
+
+The RuntimeClasses select on `nvidia.com/cc.ready.state`, the label the NVIDIA GPU
+Operator sets, so a node serves either the plain or the confidential handlers
+depending on the mode its GPUs are in. See
+[NVIDIA GPU passthrough and Kata QEMU](use-cases/NVIDIA-GPU-passthrough-and-Kata-QEMU.md)
+for the full setup.
+
+### [`try-kata-fc.values.yaml`](https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/helm-chart/kata-deploy/try-kata-fc.values.yaml)
+
+The Firecracker shim. Firecracker does not implement filesystem sharing, so images
+have to reach the guest as block devices — containerd's devmapper snapshotter.
+
+```sh
+helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
+  --version VERSION \
+  -f https://github.com/kata-containers/kata-containers/releases/download/VERSION/try-kata-fc.values.yaml
+```
+
+Includes:
+
+- `fc` - Firecracker (amd64)
+
+!!! warning "devmapper is the one snapshotter kata-deploy will not set up for you"
+    nydus and erofs it can configure; devmapper needs a thin-pool on the host,
+    which is a storage decision only you can make. Set it up on every node before
+    installing this profile — `ctr plugins ls | grep devmapper` must report `ok` —
+    otherwise the `kata-fc` RuntimeClass exists but every pod using it fails to
+    start. See
+    [How to use Kata Containers with Firecracker](how-to/how-to-use-kata-containers-with-firecracker.md).
+
+### [`try-kata-remote.values.yaml`](https://github.com/kata-containers/kata-containers/blob/main/tools/packaging/kata-deploy/helm-chart/kata-deploy/try-kata-remote.values.yaml)
+
+The remote hypervisor shim, better known as *peer pods*. It starts no VM on the
+node: sandbox creation is handed to a provider running elsewhere — in practice
+Confidential Containers' cloud-api-adaptor, which creates the VM in your cloud.
+Images are pulled inside that pod VM, hence nydus and guest pull.
+
+```sh
+helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
+  --version VERSION \
+  -f https://github.com/kata-containers/kata-containers/releases/download/VERSION/try-kata-remote.values.yaml
+```
+
+Includes:
+
+- `remote` - remote hypervisor / peer pods (amd64, ppc64le, s390x)
+
+!!! warning "The provider is not part of this chart"
+    This profile installs the shim and its `kata-remote` RuntimeClass, nothing
+    more. The provider, its cloud credentials and the pod VM image belong to the
+    cloud-api-adaptor deployment and have to be in place first, or the
+    RuntimeClass will exist with nothing behind it.
 
 ### `nodeSelector`
 
@@ -1076,22 +1649,21 @@ Now verify the installation by examining the `runtimeClasses`:
 
 ```sh
 $ kubectl get runtimeClasses
-NAME                            HANDLER                         AGE
-kata-clh-cicd                   kata-clh-cicd                   77s
-kata-clh-runtime-rs-cicd        kata-clh-runtime-rs-cicd        77s
-kata-dragonball-cicd            kata-dragonball-cicd            77s
-kata-fc-cicd                    kata-fc-cicd                    77s
-kata-qemu-cicd                  kata-qemu-cicd                  77s
-kata-qemu-coco-dev-cicd         kata-qemu-coco-dev-cicd         77s
-kata-qemu-nvidia-gpu-cicd       kata-qemu-nvidia-gpu-cicd       77s
-kata-qemu-nvidia-gpu-snp-cicd   kata-qemu-nvidia-gpu-snp-cicd   77s
-kata-qemu-nvidia-gpu-tdx-cicd   kata-qemu-nvidia-gpu-tdx-cicd   76s
-kata-qemu-runtime-rs-cicd       kata-qemu-runtime-rs-cicd       77s
-kata-qemu-se-runtime-rs-cicd    kata-qemu-se-runtime-rs-cicd    77s
-kata-qemu-snp-cicd              kata-qemu-snp-cicd              77s
-kata-qemu-tdx-cicd              kata-qemu-tdx-cicd              77s
-kata-stratovirt-cicd            kata-stratovirt-cicd            77s
+NAME                                 HANDLER                              AGE
+kata-clh-azure-cicd                  kata-clh-azure-cicd                  77s
+kata-clh-azure-runtime-rs-cicd       kata-clh-azure-runtime-rs-cicd       77s
+kata-clh-cicd                        kata-clh-cicd                        77s
+kata-clh-runtime-rs-cicd             kata-clh-runtime-rs-cicd             77s
+kata-dragonball-cicd                 kata-dragonball-cicd                 77s
+kata-openvmm-azure-runtime-rs-cicd   kata-openvmm-azure-runtime-rs-cicd   77s
+kata-qemu-cicd                       kata-qemu-cicd                       77s
+kata-qemu-runtime-rs-cicd            kata-qemu-runtime-rs-cicd            77s
 ```
+
+That is the default shim set ([shims](#shims)). Installing with one of the
+[profiles](#examples) instead gives you that profile's classes: adding
+`-f try-kata-tee.values.yaml` here would list the TEE set — `kata-qemu-snp-cicd`,
+`kata-qemu-tdx-cicd` and the rest — in place of the classes above.
 
 #### How installations keep out of each other's way on a node
 
@@ -1155,6 +1727,12 @@ release would restore a file that predates every release and erase the surviving
 handlers. Installation therefore fails before modifying CRI configuration when
 that unsafe combination is detected.
 
+Both containerd drop-ins carry the suffix, the generated one as
+`kata-deploy-<suffix>.toml` and the `containerd.userDropIn` content as
+`zz-kata-deploy-user-<suffix>.toml`, for the same reason: each release removes
+its own files on uninstall, and a name two releases shared would be taken from
+whichever of them is still deployed.
+
 With whole-file configuration, uninstall restores the backup taken at install
 time. A node whose containerd had no configuration file at all gets one written
 for it, and uninstall deletes that file again. Any other whole-file configuration
@@ -1213,13 +1791,16 @@ cluster (deployed by this chart with `node-feature-discovery.enabled=true` or fo
 - Intel TDX shims: `intel.feature.node.kubernetes.io/tdx: "true"`
 - IBM Secure Execution for Linux (SEL) shims (s390x): `feature.node.kubernetes.io/cpu-security.se.enabled: "true"`
 
-The chart uses Helm's `lookup` function to detect NFD (by looking for the
-`node-feature-discovery-worker` DaemonSet). Auto-inject only runs when NFD is detected and
-no manual `runtimeClass.nodeSelector` is set for that shim.
+The chart detects NFD once and uses that result for both these selectors and
+[TEE key advertisement](#tee-key-advertisement). Detection succeeds when this
+chart enables NFD, an external NFD workload is found by label, or the NFD API is
+registered. Auto-injection only runs when NFD is detected and the shim has no
+manual `runtimeClass.nodeSelector`.
 
-**Note**: NFD detection requires cluster access. During `helm template` (dry-run without a
-cluster), external NFD is not seen, so auto-injected labels are not added. Manual
-`runtimeClass.nodeSelector` values are still applied in all cases.
+!!! note "Detection needs a live cluster"
+    `helm template` cannot detect external NFD. Set a manual
+    `runtimeClass.nodeSelector` and `nodeFeatureRules.create: true` when rendering
+    manifests without cluster access.
 
 ## TEE key advertisement
 
@@ -1241,9 +1822,10 @@ nodeFeatureRules:
   create: auto   # auto | true | false
 ```
 
-`auto` renders them when NFD is in the picture: installed by this chart
-(`node-feature-discovery.enabled=true`), already present in the cluster, or its CRD
-is registered. `true` and `false` decide outright.
+`auto` renders them when NFD is in the picture, by the same detection the
+[RuntimeClass node selectors](#runtimeclass-node-selectors-for-tee-shims) use:
+installed by this chart (`node-feature-discovery.enabled=true`), already present in
+the cluster, or its CRD is registered. `true` and `false` decide outright.
 
 `false` turns off **both** halves: no rule, and no confidential `RuntimeClass` asks
 for a TEE key. It is the escape hatch for a cluster that wants no part of this — not

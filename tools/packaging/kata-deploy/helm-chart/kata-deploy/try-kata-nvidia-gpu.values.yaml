@@ -67,6 +67,11 @@ shims:
     allowedHypervisorAnnotations: []
     containerd:
       snapshotter: ""
+    # Settings for NVRC, the init process of the NVIDIA guest images. Each key
+    # becomes an nvrc.* guest kernel parameter; see docs/helm-configuration.md.
+    nvrc:
+      # Run nv-hostengine and dcgm-exporter in the guest (nvrc.dcgm=on).
+      enableDCGM: false
     runtimeClass:
       # This label is automatically added by gpu-operator. Override it
       # if you want to use a different label.
@@ -80,6 +85,8 @@ shims:
     allowedHypervisorAnnotations: []
     containerd:
       snapshotter: "erofs"
+    nvrc:
+      enableDCGM: false
     runtimeClass:
       # This label is automatically added by gpu-operator. Override it
       # if you want to use a different label.
@@ -99,11 +106,11 @@ shims:
     agent:
       httpsProxy: ""
       noProxy: ""
+    nvrc:
+      enableDCGM: false
     runtimeClass:
       # These labels are automatically added by gpu-operator and NFD
       # respectively. Override if you want to use a different label.
-      # If you don't have NFD, you need to add the snp label by other
-      # means to your SNP nodes.
       nodeSelector:
         nvidia.com/cc.ready.state: "true"
         amd.feature.node.kubernetes.io/snp: "true"
@@ -121,11 +128,11 @@ shims:
     agent:
       httpsProxy: ""
       noProxy: ""
+    nvrc:
+      enableDCGM: false
     runtimeClass:
       # These labels are automatically added by gpu-operator and NFD
       # respectively. Override if you want to use a different label.
-      # If you don't have NFD, you need to add the snp label by other
-      # means to your SNP nodes.
       nodeSelector:
         nvidia.com/cc.ready.state: "true"
         amd.feature.node.kubernetes.io/snp: "true"
@@ -143,11 +150,11 @@ shims:
     agent:
       httpsProxy: ""
       noProxy: ""
+    nvrc:
+      enableDCGM: false
     runtimeClass:
       # These labels are automatically added by gpu-operator and NFD
       # respectively. Override if you want to use a different label.
-      # If you don't have NFD, you need to add the tdx label by other
-      # means to your TDX nodes.
       nodeSelector:
         nvidia.com/cc.ready.state: "true"
         intel.feature.node.kubernetes.io/tdx: "true"
@@ -165,11 +172,11 @@ shims:
     agent:
       httpsProxy: ""
       noProxy: ""
+    nvrc:
+      enableDCGM: false
     runtimeClass:
       # These labels are automatically added by gpu-operator and NFD
       # respectively. Override if you want to use a different label.
-      # If you don't have NFD, you need to add the tdx label by other
-      # means to your TDX nodes.
       nodeSelector:
         nvidia.com/cc.ready.state: "true"
         intel.feature.node.kubernetes.io/tdx: "true"
@@ -182,3 +189,6 @@ runtimeClasses:
   enabled: true
   createDefault: false
   defaultName: "kata"
+
+node-feature-discovery:
+  enabled: true

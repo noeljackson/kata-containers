@@ -16,7 +16,7 @@ import (
 
 	"github.com/containerd/cgroups/v3"
 	cgroup1 "github.com/containerd/cgroups/v3/cgroup1"
-	cgroupsv2 "github.com/containerd/cgroups/v3/cgroup2"
+	cgroup2 "github.com/containerd/cgroups/v3/cgroup2"
 	"github.com/opencontainers/runtime-spec/specs-go"
 	"github.com/sirupsen/logrus"
 )
@@ -171,7 +171,7 @@ func NewResourceController(path string, resources *specs.LinuxResources) (Resour
 		if err != nil {
 			return nil, err
 		}
-		cgroup, err = cgroupsv2.NewManager(unifiedMountpoint, cgroupPath, cgroupsv2.ToResources(resources))
+		cgroup, err = cgroup2.NewManager(unifiedMountpoint, cgroupPath, cgroup2.ToResources(resources))
 		if err != nil {
 			return nil, err
 		}
@@ -220,13 +220,13 @@ func NewSandboxResourceController(path string, resources *specs.LinuxResources, 
 
 	// Create systemd cgroup
 	if cgroups.Mode() == cgroups.Legacy || cgroups.Mode() == cgroups.Hybrid {
-		cgHierarchy, cgPath, err := cgroupHierarchy(path)
+		cgPath, err := cgroupHierarchyPath(path)
 		if err != nil {
 			return nil, err
 		}
 
 		// load created cgroup and update with resources
-		cg, err := cgroup1.Load(cgPath, cgroup1.WithHierarchy(cgHierarchy))
+		cg, err := cgroup1.Load(cgPath)
 		if err != nil {
 			if cg.Update(&sandboxResources); err != nil {
 				return nil, err
@@ -235,9 +235,9 @@ func NewSandboxResourceController(path string, resources *specs.LinuxResources, 
 		cgroup = cg
 	} else if cgroups.Mode() == cgroups.Unified {
 		// load created cgroup and update with resources
-		cg, err := cgroupsv2.LoadSystemd(slice, unit)
+		cg, err := cgroup2.LoadSystemd(slice, unit)
 		if err != nil {
-			if cg.Update(cgroupsv2.ToResources(&sandboxResources)); err != nil {
+			if cg.Update(cgroup2.ToResources(&sandboxResources)); err != nil {
 				return nil, err
 			}
 		}
@@ -260,12 +260,12 @@ func LoadResourceController(path string, sandboxCgroupOnly bool) (ResourceContro
 
 	// load created cgroup and update with resources
 	if cgroups.Mode() == cgroups.Legacy || cgroups.Mode() == cgroups.Hybrid {
-		cgHierarchy, cgPath, err := cgroupHierarchy(path)
+		cgPath, err := cgroupHierarchyPath(path)
 		if err != nil {
 			return nil, err
 		}
 
-		cgroup, err = cgroup1.Load(cgPath, cgroup1.WithHierarchy(cgHierarchy))
+		cgroup, err = cgroup1.Load(cgPath)
 		if err != nil {
 			return nil, err
 		}
@@ -275,12 +275,12 @@ func LoadResourceController(path string, sandboxCgroupOnly bool) (ResourceContro
 			if err != nil {
 				return nil, err
 			}
-			cgroup, err = cgroupsv2.LoadSystemd(slice, unit)
+			cgroup, err = cgroup2.LoadSystemd(slice, unit)
 			if err != nil {
 				return nil, err
 			}
 		} else {
-			cgroup, err = cgroupsv2.Load(path, cgroupsv2.WithMountpoint(unifiedMountpoint))
+			cgroup, err = cgroup2.Load(path, cgroup2.WithMountpoint(unifiedMountpoint))
 			if err != nil {
 				return nil, err
 			}
@@ -304,7 +304,7 @@ func (c *LinuxCgroup) Delete() error {
 	switch cg := c.cgroup.(type) {
 	case cgroup1.Cgroup:
 		return cg.Delete()
-	case *cgroupsv2.Manager:
+	case *cgroup2.Manager:
 		if IsSystemdCgroup(c.ID()) && c.sandboxCgroupOnly {
 			if err := cg.DeleteSystemd(); err != nil {
 				return err
@@ -320,7 +320,7 @@ func (c *LinuxCgroup) Stat() (interface{}, error) {
 	switch cg := c.cgroup.(type) {
 	case cgroup1.Cgroup:
 		return cg.Stat(cgroup1.IgnoreNotExist)
-	case *cgroupsv2.Manager:
+	case *cgroup2.Manager:
 		return cg.Stat()
 	default:
 		return nil, ErrCgroupMode
@@ -331,7 +331,7 @@ func (c *LinuxCgroup) AddProcess(pid int, subsystems ...string) error {
 	switch cg := c.cgroup.(type) {
 	case cgroup1.Cgroup:
 		return cg.AddProc(uint64(pid))
-	case *cgroupsv2.Manager:
+	case *cgroup2.Manager:
 		return cg.AddProc(uint64(pid))
 	default:
 		return ErrCgroupMode
@@ -342,7 +342,7 @@ func (c *LinuxCgroup) AddThread(pid int, subsystems ...string) error {
 	switch cg := c.cgroup.(type) {
 	case cgroup1.Cgroup:
 		return cg.AddTask(cgroup1.Process{Pid: pid})
-	case *cgroupsv2.Manager:
+	case *cgroup2.Manager:
 		return cg.AddProc(uint64(pid))
 	default:
 		return ErrCgroupMode
@@ -353,8 +353,8 @@ func (c *LinuxCgroup) Update(resources *specs.LinuxResources) error {
 	switch cg := c.cgroup.(type) {
 	case cgroup1.Cgroup:
 		return cg.Update(resources)
-	case *cgroupsv2.Manager:
-		return cg.Update(cgroupsv2.ToResources(resources))
+	case *cgroup2.Manager:
+		return cg.Update(cgroup2.ToResources(resources))
 	default:
 		return ErrCgroupMode
 	}
@@ -363,17 +363,17 @@ func (c *LinuxCgroup) Update(resources *specs.LinuxResources) error {
 func (c *LinuxCgroup) MoveTo(path string) error {
 	switch cg := c.cgroup.(type) {
 	case cgroup1.Cgroup:
-		cgHierarchy, cgPath, err := cgroupHierarchy(path)
+		cgPath, err := cgroupHierarchyPath(path)
 		if err != nil {
 			return err
 		}
-		newCgroup, err := cgroup1.Load(cgPath, cgroup1.WithHierarchy(cgHierarchy))
+		newCgroup, err := cgroup1.Load(cgPath)
 		if err != nil {
 			return err
 		}
 		return cg.MoveTo(newCgroup)
-	case *cgroupsv2.Manager:
-		newCgroup, err := cgroupsv2.Load(path, cgroupsv2.WithMountpoint(unifiedMountpoint))
+	case *cgroup2.Manager:
+		newCgroup, err := cgroup2.Load(path, cgroup2.WithMountpoint(unifiedMountpoint))
 		if err != nil {
 			return err
 		}
@@ -401,8 +401,8 @@ func (c *LinuxCgroup) AddDevice(deviceHostPath string) error {
 		}); err != nil {
 			return err
 		}
-	case *cgroupsv2.Manager:
-		if err := cg.Update(cgroupsv2.ToResources(&specs.LinuxResources{
+	case *cgroup2.Manager:
+		if err := cg.Update(cgroup2.ToResources(&specs.LinuxResources{
 			Devices: c.devices,
 		})); err != nil {
 			return err
@@ -438,8 +438,8 @@ func (c *LinuxCgroup) RemoveDevice(deviceHostPath string) error {
 		}); err != nil {
 			return err
 		}
-	case *cgroupsv2.Manager:
-		if err := cg.Update(cgroupsv2.ToResources(&specs.LinuxResources{
+	case *cgroup2.Manager:
+		if err := cg.Update(cgroup2.ToResources(&specs.LinuxResources{
 			Devices: c.devices,
 		})); err != nil {
 			return err
@@ -478,8 +478,8 @@ func (c *LinuxCgroup) UpdateCpuSet(cpuset, memset string) error {
 		return cg.Update(&specs.LinuxResources{
 			CPU: c.cpusets,
 		})
-	case *cgroupsv2.Manager:
-		return cg.Update(cgroupsv2.ToResources(&specs.LinuxResources{
+	case *cgroup2.Manager:
+		return cg.Update(cgroup2.ToResources(&specs.LinuxResources{
 			CPU: c.cpusets,
 		}))
 	default:

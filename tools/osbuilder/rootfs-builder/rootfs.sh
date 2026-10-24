@@ -423,7 +423,9 @@ build_nvidia_gpu_extension_in_container()
 	local image_name="nvidia-gpu-extension-osbuilder"
 	local nvidia_dir="${script_dir}/nvidia"
 	local cuda_repo_url cuda_repo_pkg gpu_base_os_version ctk_version
-	local tools_repo_url tools_repo_pkg
+	local tools_repo_url tools_repo_pkg upx_version
+	local driver_repo_url driver_repo_pkg
+	local dcgm_version dcgm_exporter_version
 	local -a build_args run_args
 
 	if [[ -n "${USE_DOCKER}" ]]; then
@@ -439,12 +441,26 @@ build_nvidia_gpu_extension_in_container()
 	gpu_base_os_version=$(get_package_version_from_kata_yaml "assets.image.architecture.${ARCH}.nvidia-gpu.version")
 	tools_repo_url=$(get_package_version_from_kata_yaml "externals.nvidia.tools.repo.${ARCH}.url")
 	tools_repo_pkg=$(get_package_version_from_kata_yaml "externals.nvidia.tools.repo.${ARCH}.pkg")
+	driver_repo_url=$(get_package_version_from_kata_yaml "externals.nvidia.driver.repo.${ARCH}.url")
+	driver_repo_pkg=$(get_package_version_from_kata_yaml "externals.nvidia.driver.repo.${ARCH}.pkg")
+	# Both or neither - fail before anything builds, not an hour later
+	# inside the chroot.
+	if [[ -n "${driver_repo_url}${driver_repo_pkg}" ]] && { [[ -z "${driver_repo_url}" ]] || [[ -z "${driver_repo_pkg}" ]]; }; then
+		die "driver repository misconfigured: url='${driver_repo_url}' pkg='${driver_repo_pkg}' - set both or neither"
+	fi
 	ctk_version=$(get_package_version_from_kata_yaml "externals.nvidia.ctk.version")
+	upx_version=$(get_package_version_from_kata_yaml "externals.upx.version")
+	dcgm_version=$(get_package_version_from_kata_yaml "externals.nvidia.dcgm.version")
+	dcgm_exporter_version=$(get_package_version_from_kata_yaml "externals.nvidia.dcgm.exporter.version")
 
 	[[ -n "${IMAGE_REGISTRY}" ]] \
 		&& build_args+=(--build-arg "IMAGE_REGISTRY=${IMAGE_REGISTRY}")
 	[[ "${container_engine}" == "podman" ]] \
 		&& build_args+=(--runtime "${DOCKER_RUNTIME}")
+	case "${ARCH}" in
+		x86_64)  build_args+=(--platform linux/amd64) ;;
+		aarch64) build_args+=(--platform linux/arm64) ;;
+	esac
 
 	generate_dockerfile "${nvidia_dir}"
 	"${container_engine}" build \
@@ -458,7 +474,12 @@ build_nvidia_gpu_extension_in_container()
 		--build-arg "CUDA_REPO_PKG=${cuda_repo_pkg}" \
 		--build-arg "TOOLS_REPO_URL=${tools_repo_url}" \
 		--build-arg "TOOLS_REPO_PKG=${tools_repo_pkg}" \
+		--build-arg "DRIVER_REPO_URL=${driver_repo_url}" \
+		--build-arg "DRIVER_REPO_PKG=${driver_repo_pkg}" \
 		--build-arg "CTK_VERSION=${ctk_version}" \
+		--build-arg "DCGM_VERSION=${dcgm_version}" \
+		--build-arg "DCGM_EXPORTER_VERSION=${dcgm_exporter_version}" \
+		--build-arg "UPX_VERSION=${upx_version}" \
 		-t "${image_name}" "${nvidia_dir}"
 
 	run_args=(

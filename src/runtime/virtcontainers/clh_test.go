@@ -146,6 +146,11 @@ func (c *clhClientMock) ResumeVM(ctx context.Context) (*http.Response, error) {
 	return nil, nil
 }
 
+func TestClhIommuType(t *testing.T) {
+	assert.Equal(t, chclient.IOMMUTYPE_OFF, clhIommuType(false))
+	assert.Equal(t, chclient.IOMMUTYPE_VIRTIO, clhIommuType(true))
+}
+
 func TestCloudHypervisorAddVSock(t *testing.T) {
 	assert := assert.New(t)
 	clh := cloudHypervisor{}
@@ -510,19 +515,25 @@ func TestClhCreateVM(t *testing.T) {
 	assert.NoError(err)
 	config5.SharedFS = config.VirtioFSNydus
 
+	config6, err := newClhConfig()
+	assert.NoError(err)
+	config6.DisableNestedVirtualization = true
+
 	type testData struct {
 		config      HypervisorConfig
 		expectError bool
 		configMatch bool
+		wantNested  bool
 	}
 
 	data := []testData{
-		{config0, false, true},
-		{config1, false, true},
-		{config2, false, true},
-		{config3, true, false},
-		{config4, false, true},
-		{config5, false, true},
+		{config0, false, true, true},
+		{config1, false, true, true},
+		{config2, false, true, true},
+		{config3, true, false, false},
+		{config4, false, true, true},
+		{config5, false, true, true},
+		{config6, false, true, false},
 	}
 
 	for i, d := range data {
@@ -536,6 +547,8 @@ func TestClhCreateVM(t *testing.T) {
 		}
 
 		assert.NoError(err, msg)
+
+		assert.Equal(d.wantNested, clh.vmconfig.Cpus.GetNested(), msg)
 
 		if d.configMatch {
 			assert.Exactly(d.config, clh.config, msg)
@@ -808,7 +821,7 @@ func TestCloudHypervisorColdPlugVFIODevice(t *testing.T) {
 	// Verify the device was added to vmconfig.Devices
 	assert.NotNil(clh.vmconfig.Devices)
 	assert.Len(*clh.vmconfig.Devices, 1)
-	assert.Equal("/sys/bus/pci/devices/0000:41:00.0", (*clh.vmconfig.Devices)[0].Path)
+	assert.Equal("/sys/bus/pci/devices/0000:41:00.0", (*clh.vmconfig.Devices)[0].GetPath())
 	assert.Equal("gpu0", clh.devicesIds["gpu0"])
 
 	// Cold-plug a second device

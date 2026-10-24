@@ -6,11 +6,13 @@
 #[cfg(test)]
 mod tests {
     use anyhow::Context;
+    use std::collections::BTreeMap;
     use std::fmt::{self, Display};
     use std::fs::{self, File};
     use std::path;
     use std::str;
 
+    use json_patch::{patch, Patch};
     use protocols::agent::{
         AddARPNeighborsRequest, CreateContainerRequest, CreateSandboxRequest, ExecProcessRequest,
         RemoveContainerRequest, UpdateInterfaceRequest, UpdateRoutesRequest,
@@ -50,6 +52,18 @@ mod tests {
         }
     }
 
+    impl TestRequest {
+        fn is_stateful(&self) -> bool {
+            matches!(
+                self,
+                Self::CreateContainerRequest(_)
+                    | Self::CreateSandboxRequest(_)
+                    | Self::ExecProcessRequest(_)
+                    | Self::RemoveContainerRequest(_)
+            )
+        }
+    }
+
     fn serialize_request_only(value: &TestRequest) -> serde_json::Result<serde_json::Value> {
         if let serde_json::Value::Object(map) = serde_json::to_value(value)? {
             for (k, v) in map {
@@ -65,17 +79,26 @@ mod tests {
     struct TestCase {
         description: String,
         allowed: bool,
-        #[serde(flatten)]
-        request: TestRequest,
+        base: String,
+        #[serde(default)]
+        patch: Patch,
+    }
+
+    #[derive(Clone, Debug, Deserialize, Serialize)]
+    struct TestCases {
+        bases: BTreeMap<String, TestRequest>,
+        cases: Vec<TestCase>,
     }
 
     /// Run tests from the given directory.
     /// The directory is searched under `src/tools/genpolicy/tests/testdata`, and
-    /// it must contain a `resources.yaml` file as well as a `testcases.json` file.
-    /// The resources must produce a policy when fed into genpolicy, so there
-    /// should be exactly one entry with a PodSpec. The test case file must contain
-    /// a JSON list of [TestCase] instances. Each instance will be of type enum TestRequest,
-    /// with the tag `type` listing the exact type of request.
+    /// it must contain a `pod.yaml` file as well as a `testcases.json` file.
+    /// The pod must produce a policy when fed into genpolicy, so there
+    /// should be exactly one entry with a PodSpec. The test case file contains named base
+    /// requests and ordered cases. Each case applies an RFC 6902 JSON Patch to the payload of
+    /// its selected base request.
+    /// An optional `settings-patch.json` file in the test case directory customizes
+    /// the genpolicy settings used by that test.
     async fn runtests(test_case_dir: &str) {
         // Check if config_map.yaml exists.
         // If it does, we need to copy it to the workdir.
@@ -93,6 +116,8 @@ mod tests {
 
         // Prepare temp dir for running genpolicy.
         let (workdir, testdata_dir) = prepare_workdir(test_case_dir, &files_to_copy);
+
+        let settings = prepare_settings(&workdir, &testdata_dir);
 
         let config_files = if is_config_map_file_present {
             Some(vec![workdir
@@ -113,9 +138,7 @@ mod tests {
             raw_out: false,
             rego_rules_path: workdir.join("rules.rego").to_str().unwrap().to_string(),
             runtime_class_names: Vec::new(),
-            settings: genpolicy::settings::Settings::new(
-                workdir.join("genpolicy-settings.json").to_str().unwrap(),
-            ),
+            settings,
             silent_unsupported_fields: false,
             use_cache: false,
             version: false,
@@ -165,20 +188,42 @@ mod tests {
 
         let case_file =
             File::open(testdata_dir.join("testcases.json")).expect("test case file should open");
-        let test_cases: Vec<TestCase> =
+        let test_cases: TestCases =
             serde_json::from_reader(case_file).expect("test case file should parse");
 
-        for test_case in test_cases {
+        for test_case in test_cases.cases {
             println!("\n== case: {} ==\n", test_case.description);
 
-            let v = serialize_request_only(&test_case.request).unwrap();
-
-            let results = pol
-                .allow_request(
-                    &test_case.request.to_string(),
-                    &serde_json::to_string(&v).unwrap(),
+            let base = test_cases
+                .bases
+                .get(&test_case.base)
+                .unwrap_or_else(|| panic!("Unknown test case base: {}", test_case.base));
+            let mut request = serialize_request_only(base).unwrap();
+            patch(&mut request, &test_case.patch).unwrap_or_else(|e| {
+                panic!(
+                    "Failed to apply patch for test case {}: {}",
+                    test_case.description, e
                 )
-                .await;
+            });
+
+            let ep = base.to_string();
+            let request = serde_json::to_string(&request).unwrap();
+            let results = if base.is_stateful() {
+                match pol.evaluate_request(&ep, &request).await {
+                    Ok(decision) => {
+                        let allowed = decision.allowed();
+                        let prints = decision.prints().to_owned();
+                        if allowed {
+                            decision.commit(&mut pol).await.map(|_| (allowed, prints))
+                        } else {
+                            Ok((allowed, prints))
+                        }
+                    }
+                    Err(err) => Err(err),
+                }
+            } else {
+                pol.allow_request(&ep, &request).await
+            };
 
             let logs = fs::read_to_string(workdir.join("policy.log")).unwrap();
             let results = results.unwrap();
@@ -218,7 +263,7 @@ ConfidentialStorageTest if {
     annotations := input.request.OCI.Annotations
     annotations["io.kubernetes.cri.container-name"] == input.container_name
     annotations["io.kubernetes.cri.image-name"] == input.image
-    allow_storages([], input.request.storages, "", "")
+    allow_storages({"storages": []}, input.request.storages, "", "")
     allow_confidential_volumes(input.policy, input.request.OCI.Mounts, input.request.storages)
     count(input.request.OCI.Mounts) == count(input.policy)
     raw_agent_devices := [device | some device in input.request.devices; device.container_path == input.device_path]
@@ -390,7 +435,7 @@ MountSourceAdvisoryTest if {
 }
 default ImagePullMountPointAdvisoryTest := false
 ImagePullMountPointAdvisoryTest if {
-    allow_storage([], input.storage, input.bundle_id, "sandbox")
+    allow_storage(input.policy_container, input.storage, input.bundle_id, "sandbox")
 }
 "#,
         );
@@ -462,6 +507,16 @@ ImagePullMountPointAdvisoryTest if {
                     "shared": false,
                     "source": "image"
                 },
+                "policy_container": {
+                    "image": "image",
+                    "OCI": {
+                        "Annotations": {
+                            "io.kubernetes.cri.container-type": "container",
+                            "io.katacontainers.pkg.oci.container_type": "pod_container"
+                        }
+                    },
+                    "storages": []
+                },
                 "bundle_id": "bundle"
             })
         };
@@ -519,6 +574,26 @@ ImagePullMountPointAdvisoryTest if {
             .to_string()
     }
 
+    fn prepare_settings(
+        workdir: &path::Path,
+        testdata_dir: &path::Path,
+    ) -> genpolicy::settings::Settings {
+        let settings_patch = testdata_dir.join("settings-patch.json");
+        if settings_patch.exists() {
+            let drop_in_dir = workdir.join("genpolicy-settings.d");
+            fs::create_dir(&drop_in_dir).expect("settings drop-in directory should be created");
+            fs::copy(&settings_patch, drop_in_dir.join("settings-patch.json"))
+                .context(format!(
+                    "{:?} --> {:?}",
+                    settings_patch,
+                    drop_in_dir.join("settings-patch.json")
+                ))
+                .expect("copying the settings patch should not fail");
+        }
+
+        genpolicy::settings::Settings::new(workdir.to_str().unwrap())
+    }
+
     fn prepare_workdir(
         test_case_dir: &str,
         files_to_copy: &[&str],
@@ -535,7 +610,15 @@ ImagePullMountPointAdvisoryTest if {
         // Make sure that workdir is empty.
         for entry in fs::read_dir(&workdir).expect("should be able to read directories") {
             let entry = entry.expect("should be able to read directory entries");
-            fs::remove_file(entry.path()).expect("should be able to remove files");
+            if entry
+                .file_type()
+                .expect("workdir entry should have a file type")
+                .is_dir()
+            {
+                fs::remove_dir_all(entry.path()).expect("should be able to remove directories");
+            } else {
+                fs::remove_file(entry.path()).expect("should be able to remove files");
+            }
         }
 
         for file in files_to_copy {
@@ -596,6 +679,11 @@ ImagePullMountPointAdvisoryTest if {
     #[tokio::test]
     async fn test_create_container_image_guest_pull_count() {
         runtests("createcontainer/image_guest_pull_count").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_image_host_pull() {
+        runtests("createcontainer/image_host_pull").await;
     }
 
     #[tokio::test]
@@ -661,6 +749,21 @@ ImagePullMountPointAdvisoryTest if {
     #[tokio::test]
     async fn test_create_container_volumes_container_image() {
         runtests("createcontainer/volumes/container_image").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_image_guest_pull_storage_validation() {
+        runtests("createcontainer/image_guest_pull_storage_validation").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_image_guest_pull_source_pinned() {
+        runtests("createcontainer/image_guest_pull_source/pinned").await;
+    }
+
+    #[tokio::test]
+    async fn test_create_container_image_guest_pull_source_unpinned() {
+        runtests("createcontainer/image_guest_pull_source/unpinned").await;
     }
 
     #[tokio::test]

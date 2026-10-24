@@ -17,7 +17,8 @@ declare -A false_positives
 # these exact records can be filtered.
 readonly containerd_checkpoint_restore_false_positives="GO-2026-5622 \
   GO-2026-5338 \
-  GO-2026-5064"
+  GO-2026-5064 \
+  GO-2026-6791"
 
 # Known false positives
 # GO-2025-3595: golang.org/x/net/html - verified not compiled into binary

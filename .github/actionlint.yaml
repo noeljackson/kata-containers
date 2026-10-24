@@ -10,12 +10,15 @@ self-hosted-runner:
     - amd64-nvidia-a100
     - amd64-nvidia-h100-snp
     - arm64-k8s
+    - arm64-nvidia-cpu
+    - arm64-nvidia-gpu
     - garm-ubuntu-2004
     - garm-ubuntu-2004-smaller
     - garm-ubuntu-2204
     - garm-ubuntu-2304
     - garm-ubuntu-2304-smaller
     - garm-ubuntu-2204-smaller
+    - kata-deploy-selinux
     - ppc64le
     - ppc64le-k8s
     - ppc64le-small

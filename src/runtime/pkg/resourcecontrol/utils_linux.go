@@ -56,22 +56,20 @@ func newProperty(name string, units interface{}) systemdDbus.Property {
 	}
 }
 
-func cgroupHierarchy(path string) (cgroup1.Hierarchy, cgroup1.Path, error) {
+// cgroupHierarchyPath returns the cgroup1 Path for the given cgroup path.
+func cgroupHierarchyPath(path string) (cgroup1.Path, error) {
 	if !IsSystemdCgroup(path) {
-		return cgroup1.Default, cgroup1.StaticPath(path), nil
-	} else {
-		slice, unit, err := getSliceAndUnit(path)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		cgroupSlicePath, _ := systemd.ExpandSlice(slice)
-		if err != nil {
-			return nil, nil, err
-		}
-
-		return cgroup1.Systemd, cgroup1.Slice(cgroupSlicePath, unit), nil
+		return cgroup1.StaticPath(path), nil
 	}
+
+	slice, unit, err := getSliceAndUnit(path)
+	if err != nil {
+		return nil, err
+	}
+
+	cgroupSlicePath, _ := systemd.ExpandSlice(slice)
+
+	return cgroup1.Slice(cgroupSlicePath, unit), nil
 }
 
 func createCgroupsSystemd(slice string, unit string, pid int) error {

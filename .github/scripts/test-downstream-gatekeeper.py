@@ -46,7 +46,7 @@ def validate(config: dict[str, Any], workflow: dict[str, Any]) -> None:
 
     static_names = mapping["static"]["names"]
     required_static_fragments = (
-        "ubuntu-22.04",
+        "ubuntu-24.04)",
         "ubuntu-24.04-arm",
         "make test, runtime-rs",
         "make test, runtime,",

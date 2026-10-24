@@ -16,13 +16,19 @@ virtcontainers
 
 # Open source projects
 bootc
+Bottlerocket
 distroless
+eudev
+libseccomp
 materialx
 ostree
+Talos
 
 # Hardware & Architecture
 AMD
+APIC
 APQN
+cdev
 chiplet
 cpuid
 DCAP
@@ -47,6 +53,7 @@ SNP
 SRIOV
 TDX
 VBIOS
+VCEK
 VGPU
 VPMU
 
@@ -110,6 +117,7 @@ vsock
 GHSA
 LUKS
 ocicrypt
+RUSTSEC
 
 # Container, Runtime & Misc terms
 Burstable
@@ -142,9 +150,19 @@ passthroughfd
 passfd
 sendfd
 RunD
+udev
 udevd
 Reflink
 UNBINDABLE
 RAII
 Virt
 sysfs
+openrc
+ultravisor
+AAVMF
+XICS
+XIVE
+Rego
+kcli
+podvm
+eMudhra

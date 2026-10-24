@@ -23,7 +23,7 @@ use dragonball::{
     },
     device_manager::{
         balloon_dev_mgr::BalloonDeviceConfigInfo, mem_dev_mgr::MemDeviceConfigInfo,
-        vfio_dev_mgr::HostDeviceConfig,
+        rng_dev_mgr::RngDeviceConfigInfo, vfio_dev_mgr::HostDeviceConfig,
     },
     vm::VmConfigInfo,
     Vmm,
@@ -145,7 +145,7 @@ impl VmmInstance {
                         if let Some(netns_path) = netns {
                             info!(sl!(), "set netns for vmm master {}", &netns_path);
                             let netns_fd = File::open(&netns_path)
-                                .with_context(|| format!("open netns path {}", &netns_path))?;
+                                .with_context(|| format!("open netns path {}", netns_path))?;
                             setns(&netns_fd, CloneFlags::CLONE_NEWNET).context("set netns ")?;
                         }
                         let exit_code =
@@ -353,6 +353,12 @@ impl VmmInstance {
     pub fn insert_balloon_device(&self, cfg: BalloonDeviceConfigInfo) -> Result<()> {
         self.handle_request(Request::Sync(VmmAction::InsertBalloonDevice(cfg.clone())))
             .with_context(|| format!("Failed to insert balloon device: {cfg:?}"))?;
+        Ok(())
+    }
+
+    pub fn insert_rng_device(&self, cfg: RngDeviceConfigInfo) -> Result<()> {
+        self.handle_request(Request::Sync(VmmAction::InsertRngDevice(cfg.clone())))
+            .with_context(|| format!("Failed to insert rng device: {cfg:?}"))?;
         Ok(())
     }
 

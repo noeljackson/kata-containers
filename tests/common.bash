@@ -790,17 +790,33 @@ function install_tarball() {
 	popd || return
 }
 
+function link_binaries() {
+	declare -r target_dir="${1:-/usr/local/bin}"
+	shift
+
+	local linked_names
+	declare -A linked_names=()
+	for b in "$@"; do
+		[[ -e "${b}" ]] || continue
+		local name
+		name="$(basename "${b}")"
+		# First entry in this invocation wins, so earlier globs take
+		# precedence over later ones.
+		[[ -n "${linked_names[${name}]+_}" ]] && continue
+		sudo ln -sfT "${b}" "${target_dir}/${name}"
+		linked_names["${name}"]=1
+	done
+}
+
 function install_kata_tools() {
 	declare -r katadir="/opt/kata"
 	declare -r tarballdir="${1:-kata-tools-artifacts}"
-	declare -r local_bin_dir="/usr/local/bin/"
+	declare -r local_bin_dir="/usr/local/bin"
 
 	install_tarball "${katadir}" "${tarballdir}" "kata-tools-static.tar.zst" false
 
 	# create symbolic links to kata-tools components
-	for b in "${katadir}"/bin/* ; do
-		sudo ln -sf "${b}" "${local_bin_dir}/$(basename "${b}")"
-	done
+	link_binaries "${local_bin_dir}" "${katadir}"/bin/*
 }
 
 # Install the standalone agent component tarball (provides /usr/bin/kata-agent).
@@ -815,7 +831,7 @@ function install_kata_agent() {
 function install_kata() {
 	declare -r katadir="/opt/kata"
 	declare -r tarballdir="kata-artifacts"
-	declare -r local_bin_dir="/usr/local/bin/"
+	declare -r local_bin_dir="/usr/local/bin"
 	local tarball="kata-static.tar.zst"
 
 	case "${KATA_HYPERVISOR:-qemu-runtime-rs}" in
@@ -830,10 +846,7 @@ function install_kata() {
 	install_tarball "${katadir}" "${tarballdir}" "${tarball}" true
 
 	# create symbolic links to kata components
-	for b in "${katadir}"/bin/* "${katadir}"/runtime-rs/bin/* ; do
-		[[ -e "${b}" ]] || continue
-		sudo ln -sf "${b}" "${local_bin_dir}/$(basename "${b}")"
-	done
+	link_binaries "${local_bin_dir}" "${katadir}"/bin/* "${katadir}"/runtime-rs/bin/*
 
 	if [[ "${CONTAINER_ENGINE:=containerd}" = "containerd" ]]; then
 		check_containerd_config_for_kata
@@ -1035,7 +1048,7 @@ function ensure_yq() {
 	export GOPATH
 	export PATH="${GOPATH}/bin:${PATH}"
 	INSTALL_IN_GOPATH=true "${repo_root_dir}/ci/install_yq.sh"
-	hash -d yq 2> /dev/null || true # yq is preinstalled on GHA Ubuntu 22.04 runners so we clear Bash's PATH cache.
+	hash -d yq 2> /dev/null || true # yq may be preinstalled on GHA runners; clear Bash's PATH cache.
 }
 
 function ensure_pip() {
@@ -1400,9 +1413,19 @@ function install_crio() {
 	sudo mkdir -p /etc/apt/keyrings
 	sudo mkdir -p /etc/apt/sources.list.d
 
-	curl -fsSL "https://pkgs.k8s.io/addons:/cri-o:/stable:/v${version}/deb/Release.key" | \
+	local major minor repo_url
+	major=$(echo "${version}" | cut -d. -f1)
+	minor=$(echo "${version}" | cut -d. -f2)
+
+	if [[ "${major}" -gt 1 || "${minor}" -ge 33 ]]; then
+		repo_url="https://download.opensuse.org/repositories/isv:/cri-o:/stable:/v${version}/deb"
+	else
+		repo_url="https://pkgs.k8s.io/addons:/cri-o:/stable:/v${version}/deb"
+	fi
+
+	curl -fsSL "${repo_url}/Release.key" | \
 		sudo gpg --dearmor -o /etc/apt/keyrings/cri-o-apt-keyring.gpg
-	echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] https://pkgs.k8s.io/addons:/cri-o:/stable:/v${version}/deb/ /" | \
+	echo "deb [signed-by=/etc/apt/keyrings/cri-o-apt-keyring.gpg] ${repo_url}/ /" | \
 		sudo tee /etc/apt/sources.list.d/cri-o.list
 
 	apt_get_update

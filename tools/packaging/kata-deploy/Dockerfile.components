@@ -59,8 +59,8 @@ COPY --from=nydus-source-builder /opt/nydus-snapshotter /opt/nydus-snapshotter
 #### Build binary package
 FROM ubuntu:22.04 AS rust-builder
 
-# Default to Rust 1.96
-ARG RUST_TOOLCHAIN=1.96
+# Default to Rust 1.97
+ARG RUST_TOOLCHAIN=1.97
 ENV DEBIAN_FRONTEND=noninteractive
 ENV RUSTUP_HOME="/opt/rustup"
 ENV CARGO_HOME="/opt/cargo"
@@ -91,6 +91,8 @@ WORKDIR /kata
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY tools/packaging/kata-deploy/binary ./tools/packaging/kata-deploy/binary
+COPY tools/packaging/kata-deploy/shim-components.json ./tools/packaging/kata-deploy/shim-components.json
+COPY tools/packaging/kata-deploy/selinux ./tools/packaging/kata-deploy/selinux
 
 # Install target and run tests based on architecture
 # - AMD64/arm64: use musl for fully static binaries

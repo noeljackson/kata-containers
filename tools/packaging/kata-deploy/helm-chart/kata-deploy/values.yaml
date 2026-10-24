@@ -38,6 +38,16 @@
 #   come back after a reboot. Uninstall drops that file but never unloads a
 #   module, because module state is host-global and may be in use by something
 #   else.
+#
+# NOTE on finding out what went wrong in "job" mode:
+#   A failed rollout names the nodes that failed and what stopped each of them,
+#   in the `helm install` output, as an Event on each node, and afterwards under
+#   `kubectl get nodes -l kata-deploy-job-dispatcher/result=failed`. None of it
+#   is configured here; it is what a rollout does.
+#
+#   Each stage writes why it is giving up to /dev/termination-log, so the reason
+#   is in the pod's status rather than only in a log that
+#   job.ttlSecondsAfterFinished deletes along with the pod.
 deploymentMode: job  # daemonset | job
 
 # Settings specific to deploymentMode: job
@@ -48,7 +58,7 @@ job:
   # released independently of Kata Containers, so its version is pinned here.
   dispatcherImage:
     reference: ghcr.io/kata-containers/k8s-job-dispatcher
-    tag: "0.2.0"
+    tag: "0.3.0"
   # Where the dispatcher pods themselves may run (install and uninstall). Nothing
   # to do with which nodes get Kata - that is the top-level `nodeSelector` /
   # `affinity` / `tolerations`.
@@ -204,6 +214,21 @@ job:
   # failed. One node failing never aborts the others.
   backoffLimit: 3
 
+# SELinux confinement for the installer's own containers. On an enforcing node
+# the unprivileged install stages are otherwise denied the host work they exist
+# to do; this loads a Kata-owned policy module and gives each stage a
+# least-privilege domain instead, so they can stay unprivileged.
+#
+# Needs policycoreutils (for semodule) on the SELinux-enabled nodes, unless their
+# policy already defines the domains. Nodes with SELinux off are unaffected, so it
+# is safe to set across a mixed cluster.
+#
+# Off by default because it mutates the node's policy store, and the modules are
+# left loaded on uninstall: list them with `semodule --list-modules=full | grep
+# kata-deploy` and remove each with `semodule -X <priority> -r <name>`.
+selinux:
+  enabled: false
+
 imagePullPolicy: Always
 
 imagePullSecrets: []
@@ -253,20 +278,33 @@ monitor:
       memory: 300Mi
 
 # Which Kubernetes flavour this cluster runs. It picks the host directory that
-# holds containerd's configuration, which is mounted into the install.
+# holds containerd's configuration, which is mounted into the install, and where
+# the kubelet keeps its root directory: k0s and microk8s both move it, and only
+# the right one leads to a Kata workload's ConfigMap/Secret updates and to the
+# Pod Resources API socket that GPU cold plug asks for its devices.
 #
 # Getting it wrong used to pass unnoticed: the install detects the runtime on the
 # node itself, so it would write a correct configuration into whichever directory
 # was mounted - and if that is not the one this node's containerd reads, Kata is
 # configured where nothing looks for it. The install now refuses to continue when
 # the two disagree, naming the value to set. Setting containerd.configDir takes
-# that check out of the way, being an explicit override of this derivation.
+# that check out of the way, being an explicit override of this derivation; it
+# says nothing about the kubelet, so this value still applies there.
 k8sDistribution: "k8s"  # k8s, k3s, rke2, k0s, microk8s
 
 # Containerd configuration overrides
 # These override the auto-detected paths based on k8sDistribution.
 # Use these when your containerd setup doesn't match any built-in distribution preset.
 containerd:
+  # Extra pod annotation patterns containerd passes to every Kata runtime,
+  # matched with filepath.Match.
+  #
+  # Whatever each runtime's Kata configuration enables is already forwarded.
+  # Agent, runtime, and container-resource annotations are not, nor is anything
+  # from another component. Add those patterns here.
+  # ["io.katacontainers.*"] restores the old unrestricted forwarding and is a
+  # security risk: any Kata annotation reaches the runtime.
+  extraPodAnnotations: []
   # Override the host directory where containerd config lives.
   # When empty, derived automatically from k8sDistribution.
   # Example: "/etc/my-containerd/"
@@ -282,7 +320,8 @@ containerd:
   configFileName: ""
   # Optional user-provided containerd drop-in TOML content.
   # This is written as an extra drop-in loaded after kata-deploy's generated drop-in,
-  # so user keys can override kata-deploy defaults.
+  # so user keys can override kata-deploy defaults. Its file name carries
+  # env.multiInstallSuffix, so side-by-side installations each own their own.
   # NOTE: default_size = "0" selects memory-backed rw layers even when
   # erofsSnapshotterMode is "disk"; do not set it when disk backing is intended.
   # Example: disable erofs fs-verity when the host backing filesystem may not
@@ -535,8 +574,15 @@ health:
     failureThreshold: 3
     timeoutSeconds: 3
 
+# Snapshotters kata-deploy sets up in the node's containerd.
+#
+# Empty by default, because none of the shims this file enables asks for one:
+# they read images through whatever snapshotter containerd already uses. The
+# shims that do need one - guest pull through nydus, shared_fs=none through
+# erofs - are not in this file either; they come with the try-*.values.yaml
+# profile that sets the snapshotter up for them (see `shims` below).
 snapshotter:
-  setup: ["nydus"]  # ["nydus", "erofs"] or []
+  setup: []  # ["nydus", "erofs"] or []
   # EROFS merge mode: "merged" (default) or "unmerged".
   #
   # "merged" forces containerd's erofs snapshotter to merge all image layers
@@ -600,6 +646,50 @@ snapshotter:
 nodeBinaries: {}
 
 # Shim configuration
+#
+# The shims listed here are the ones that run on an ordinary node: they read
+# images through whatever snapshotter containerd already uses, and ask nothing
+# of the host beyond hardware virtualization. That is what makes enabling all of
+# them by default safe - every RuntimeClass a default install creates can
+# actually start a pod on a node of an architecture in its supportedArches.
+# RuntimeClasses are cluster-wide and do not schedule by architecture, so on a
+# mixed-architecture cluster an amd64-only class such as kata-clh can still land
+# a pod on an arm64 node, where its handler was never installed.
+#
+# The shims that are NOT here each come with a prerequisite this chart cannot
+# satisfy on its own: a particular containerd snapshotter (nydus, erofs,
+# devmapper), a confidential-computing capable CPU, an NVIDIA GPU, a peer-pod
+# provider. Enabled by default they would create RuntimeClasses that look usable
+# and fail the first pod scheduled onto them, so each lives in a values file you
+# opt into with `-f`, together with the snapshotter setup and CRI configuration it
+# needs:
+#
+#   try-kata-tee.values.yaml         AMD SEV-SNP, Intel TDX, IBM Secure Execution,
+#                                    coco-dev (nydus + guest pull)
+#   try-kata-nvidia-gpu.values.yaml  NVIDIA GPU passthrough, plus its SNP and TDX
+#                                    variants (erofs, dm-verity, nydus for TEE)
+#   try-kata-nvidia-cpu.values.yaml  NVIDIA userspace without GPU passthrough (erofs)
+#   try-kata-fc.values.yaml          Firecracker (devmapper, set up by you)
+#   try-kata-remote.values.yaml      remote hypervisor / peer pods (nydus + guest pull)
+#
+#   helm install kata-deploy oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
+#     --version VERSION -f try-kata-tee.values.yaml
+#
+# Each file is packaged with the chart, so `helm pull --untar` gets you a copy to
+# read and edit:
+#
+#   helm pull oci://ghcr.io/kata-containers/kata-deploy-charts/kata-deploy \
+#     --version VERSION --untar
+#
+# A profile is a complete values file, not a fragment: it starts from
+# `disableAll: true` and enables its own shims. Pick the one that matches your
+# nodes rather than combining two - the last `-f` wins key by key, which for two
+# profiles means a mixture neither of them describes.
+#
+# Re-adding one of those shims by hand takes its whole block, not just
+# `enabled: true`: a shim with no `supportedArches` matches no architecture and
+# is skipped without a word. Copy the block out of the profile that has it.
+#
 # By default (disableAll: false), all shims with enabled: ~ (null) are enabled.
 # Set disableAll: true to disable all shims, then explicitly enable specific ones:
 #   shims:
@@ -615,9 +705,12 @@ nodeBinaries: {}
 #       supportedArches:              # list of supported architectures
 #         - amd64
 #       allowedHypervisorAnnotations: []  # hypervisor annotations to pass through
+#       hypervisor:
+#         rootless: false             # run the VMM as an unprivileged user (see below)
 #       containerd:
 #         snapshotter: ""             # e.g. nydus, erofs, devmapper, or "" for default
 #         forceGuestPull: false       # force guest-side image pull in containerd
+#         extraPodAnnotations: []     # extra containerd pod annotations for this shim
 #       crio:
 #         guestPull: false            # enable guest-pull in CRI-O
 #       agent:
@@ -630,6 +723,23 @@ nodeBinaries: {}
 #         overhead:                  # override pod overhead (falls back to built-in defaults)
 #           memory: "160Mi"
 #           cpu: "250m"
+#
+# hypervisor.rootless runs that shim's VMM as an unprivileged user. kata-deploy
+# grants group access to /dev/kvm and to the TEE device the shim needs, and
+# records a udev rule so the permissions survive the device being re-created.
+# Each shim asks only for its own devices, so turning it on for qemu-runtime-rs
+# alone never creates the SEV or Secure Execution groups.
+#
+# /dev/vhost-vsock and /dev/vhost-net are left alone: the shim opens them while
+# still privileged and hands the VMM the descriptors, and granting access by
+# path would expose the host-wide CID namespace.
+#
+# Only the runtime-rs QEMU shims and clh-runtime-rs accept it, and asking for
+# it on any other shim fails the install. The Go runtime has a rootless option
+# of its own, but it only ever handled /dev/kvm.
+#
+# Requires deploymentMode: job, a persistent /etc, and a udev implementation
+# reading /etc/udev/rules.d. See docs/how-to/how-to-run-rootless-vmm.md.
 shims:
   disableAll: false
 
@@ -654,6 +764,8 @@ shims:
     supportedArches:
       - amd64
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: ""
 
@@ -672,14 +784,6 @@ shims:
     allowedHypervisorAnnotations: []
     containerd:
       snapshotter: ""
-
-  fc:
-    enabled: ~
-    supportedArches:
-      - amd64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: "devmapper" # requires pre-configuration on the user side
 
   qemu:
     enabled: ~
@@ -700,278 +804,10 @@ shims:
       - s390x
       - ppc64le
     allowedHypervisorAnnotations: []
+    hypervisor:
+      rootless: false
     containerd:
       snapshotter: ""
-
-  qemu-nvidia-cpu:
-    enabled: ~
-    supportedArches:
-      - amd64
-      - arm64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: ""
-
-  qemu-nvidia-cpu-runtime-rs:
-    enabled: ~
-    supportedArches:
-      - amd64
-      - arm64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: ""
-
-  qemu-nvidia-gpu:
-    enabled: ~
-    supportedArches:
-      - amd64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: ""
-    # Settings for NVRC, the init process of the NVIDIA guest images. Each key
-    # becomes an nvrc.* guest kernel parameter; see docs/helm-configuration.md.
-    nvrc:
-      # Run nv-hostengine and dcgm-exporter in the guest (nvrc.dcgm=on).
-      enableDCGM: false
-    runtimeClass:
-      # This label is automatically added by gpu-operator. Override it
-      # if you want to use a different label.
-      nodeSelector:
-        nvidia.com/cc.ready.state: "false"
-
-  qemu-nvidia-gpu-runtime-rs:
-    enabled: ~
-    supportedArches:
-      - amd64
-      - arm64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: ""
-    nvrc:
-      enableDCGM: false
-    runtimeClass:
-      # This label is automatically added by gpu-operator. Override it
-      # if you want to use a different label.
-      nodeSelector:
-        nvidia.com/cc.ready.state: "false"
-
-  qemu-nvidia-gpu-snp:
-    enabled: ~
-    supportedArches:
-      - amd64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: "nydus"
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-    nvrc:
-      enableDCGM: false
-    runtimeClass:
-      # These labels are automatically added by gpu-operator and NFD
-      # respectively. Override if you want to use a different label.
-      # If you don't have NFD, you need to add the snp label by other
-      # means to your SNP nodes.
-      nodeSelector:
-        nvidia.com/cc.ready.state: "true"
-        amd.feature.node.kubernetes.io/snp: "true"
-
-  qemu-nvidia-gpu-snp-runtime-rs:
-    enabled: ~
-    supportedArches:
-      - amd64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: "nydus"
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-    nvrc:
-      enableDCGM: false
-    runtimeClass:
-      nodeSelector:
-        nvidia.com/cc.ready.state: "true"
-        amd.feature.node.kubernetes.io/snp: "true"
-
-  qemu-nvidia-gpu-tdx:
-    enabled: ~
-    supportedArches:
-      - amd64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: "nydus"
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-    nvrc:
-      enableDCGM: false
-    runtimeClass:
-      # These labels are automatically added by gpu-operator and NFD
-      # respectively. Override if you want to use a different label.
-      # If you don't have NFD, you need to add the tdx label by other
-      # means to your TDX nodes.
-      nodeSelector:
-        nvidia.com/cc.ready.state: "true"
-        intel.feature.node.kubernetes.io/tdx: "true"
-
-  qemu-nvidia-gpu-tdx-runtime-rs:
-    enabled: ~
-    supportedArches:
-      - amd64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: "nydus"
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-    nvrc:
-      enableDCGM: false
-    runtimeClass:
-      nodeSelector:
-        nvidia.com/cc.ready.state: "true"
-        intel.feature.node.kubernetes.io/tdx: "true"
-
-  qemu-snp:
-    enabled: ~
-    supportedArches:
-      - amd64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: nydus
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-
-  qemu-snp-runtime-rs:
-    enabled: ~
-    supportedArches:
-      - amd64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: nydus
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-
-  qemu-tdx:
-    enabled: ~
-    supportedArches:
-      - amd64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: nydus
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-
-  qemu-tdx-runtime-rs:
-    enabled: ~
-    supportedArches:
-      - amd64
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: nydus
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-
-  qemu-se:
-    enabled: ~
-    supportedArches:
-      - s390x
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: nydus
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-
-  qemu-se-runtime-rs:
-    enabled: ~
-    supportedArches:
-      - s390x
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: nydus
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-
-  qemu-coco-dev:
-    enabled: ~
-    supportedArches:
-      - amd64
-      - s390x
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: nydus
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-
-  qemu-coco-dev-runtime-rs:
-    enabled: ~
-    supportedArches:
-      - amd64
-      - arm64
-      - s390x
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: nydus
-      forceGuestPull: false
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
-
-  remote:
-    enabled: false
-    supportedArches:
-      - amd64
-      - ppc64le
-      - s390x
-    allowedHypervisorAnnotations: []
-    containerd:
-      snapshotter: "nydus"
-    crio:
-      guestPull: true
-    agent:
-      httpsProxy: ""
-      noProxy: ""
 
   openvmm-azure-runtime-rs:
     enabled: ~
@@ -1093,6 +929,9 @@ verification:
 # IMPORTANT: The base config is copied AFTER kata-deploy has applied its modifications
 # (debug, proxy, annotations). Custom runtimes inherit these settings from their base.
 # RuntimeClass overhead defaults are also inherited from baseConfig when not set.
+# A custom runtime also inherits supportedArches from a matching shims.<baseConfig>
+# block, so its handler is installed only where the base shim is supported. A base
+# config with no matching shim block retains the historical all-architectures behavior.
 # Set inheritBaseOverhead: false to disable that inheritance for a custom runtime.
 #
 # Usage with values file (recommended):
@@ -1133,6 +972,11 @@ verification:
 #     helm install kata-deploy ./kata-deploy -f custom-runtimes.values.yaml
 #
 # Available base configs: qemu, qemu-nvidia-gpu, qemu-snp, qemu-tdx, clh-runtime-rs, fc, etc.
+# The choice is not limited to the shims enabled above: every configuration the
+# kata-deploy image ships is laid down on the node, so a base config can name a
+# shim that has no RuntimeClass of its own. It still needs whatever that config
+# needs - a base of qemu-snp wants the nydus snapshotter configured under
+# `containerd` below, exactly as try-kata-tee.values.yaml does for qemu-snp itself.
 # The correct shim binary is automatically selected based on the baseConfig.
 #
 customRuntimes:

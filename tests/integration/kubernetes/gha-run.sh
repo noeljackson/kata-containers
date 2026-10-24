@@ -253,7 +253,7 @@ function deploy_kata() {
 	export HELM_IMAGE_TAG="${DOCKER_TAG}"
 	export HELM_DEBUG="true"
 	# Deploy the devkit debug extension for the (non-confidential) runtime-rs
-	# class that k8s-devkit-debug-console.bats exercises. Restricted to
+	# classes that k8s-devkit-debug-console.bats exercises. Restricted to
 	# x86_64/aarch64: the devkit image and kata-ctl (its debug-console client)
 	# are not shipped on s390x/ppc64le, so devkit is neither built nor testable
 	# there.
@@ -261,7 +261,9 @@ function deploy_kata() {
 	case "${TARGET_ARCH}" in
 		x86_64 | aarch64)
 			case "${KATA_HYPERVISOR}" in
-				qemu-nvidia-cpu-runtime-rs) export HELM_DEVKIT="true" ;;
+				qemu-nvidia-cpu-runtime-rs | clh-runtime-rs | dragonball)
+					export HELM_DEVKIT="true"
+					;;
 			esac
 			;;
 	esac
@@ -519,6 +521,7 @@ function main() {
 		create-cluster) create_cluster "" ;;
 		create-cluster-kcli) create_cluster_kcli ;;
 		configure-snapshotter) configure_snapshotter ;;
+		setup-crio) setup_crio ;;
 		deploy-coco-kbs) deploy_coco_kbs ;;
 		deploy-k8s) deploy_k8s "${CONTAINER_ENGINE:-}" "${CONTAINER_ENGINE_VERSION:-}";;
 		install-bats) install_bats ;;

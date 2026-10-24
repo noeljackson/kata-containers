@@ -790,9 +790,15 @@ func TestNewFirecrackerHypervisorConfig(t *testing.T) {
 		}
 	}
 
+	expectedSharedFS := config.NoSharedFS
+
 	config, err := newFirecrackerHypervisorConfig(hypervisor)
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	if config.SharedFS != expectedSharedFS {
+		t.Errorf("Expected shared fs %v, got %v", expectedSharedFS, config.SharedFS)
 	}
 
 	if config.HypervisorPath != hypervisor.Path {
@@ -968,6 +974,12 @@ func TestNewClhHypervisorConfig(t *testing.T) {
 	if config.DiskRateLimiterOpsOneTimeBurst != 0 {
 		t.Errorf("Expected value for disk operations one time burst %v, got %v", diskRateLimiterOpsOneTimeBurst, config.DiskRateLimiterOpsOneTimeBurst)
 	}
+
+	assert.False(config.DisableNestedVirtualization)
+	hypervisor.DisableNestedVirtualization = true
+	config, err = newClhHypervisorConfig(hypervisor)
+	assert.NoError(err)
+	assert.True(config.DisableNestedVirtualization)
 }
 
 func TestHypervisorDefaults(t *testing.T) {

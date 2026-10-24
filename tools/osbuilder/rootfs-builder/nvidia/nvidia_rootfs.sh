@@ -115,13 +115,19 @@ nvidia_populate_capability_arrays() {
 	(( ${#_nvidia_icds[@]} > 0 )) || die "nvidia: no ICD entries selected from ${driver_required_files}"
 }
 
+nvidia_upx_version() {
+	get_package_version_from_kata_yaml "externals.upx.version"
+}
+
 setup_nvidia_upx() {
-	local upx_dir="${BUILD_DIR}/upx-4.2.4-${distro_arch}_linux"
+	local version
+	version="$(nvidia_upx_version)"
+	local upx_dir="${BUILD_DIR}/upx-${version}-${distro_arch}_linux"
 	[[ -x "${upx_dir}/upx" ]] && return
 
 	pushd "${BUILD_DIR}" >> /dev/null
-	curl -LO "https://github.com/upx/upx/releases/download/v4.2.4/upx-4.2.4-${distro_arch}_linux.tar.xz"
-	tar xvf "upx-4.2.4-${distro_arch}_linux.tar.xz"
+	curl -LO "https://github.com/upx/upx/releases/download/v${version}/upx-${version}-${distro_arch}_linux.tar.xz"
+	tar xvf "upx-${version}-${distro_arch}_linux.tar.xz"
 	popd >> /dev/null
 }
 
@@ -149,21 +155,63 @@ nvidia_image_layout() {
 	esac
 }
 
+# Fetch files from an OCI artifact on an anonymous-pull registry, e.g. the
+# artefacts NVIDIA/nvrc publishes for a labeled pull request. Plain curl, as
+# the rootfs builder has no oras.
+oci_artifact_fetch() {
+	local ref="${1:?oci reference required}"
+	local tag="${2:?tag required}"
+	shift 2
+
+	local registry="${ref%%/*}"
+	local repo="${ref#*/}"
+	local token manifest digest file
+	token=$(curl -fsSL "https://${registry}/token?scope=repository:${repo}:pull" | jq -er .token) \
+		|| die "nvidia: failed to fetch a pull token for ${ref} from ${registry}"
+	manifest=$(curl -fsSL -H "Authorization: Bearer ${token}" \
+		-H "Accept: application/vnd.oci.image.manifest.v1+json" \
+		"https://${registry}/v2/${repo}/manifests/${tag}") \
+		|| die "nvidia: failed to fetch the manifest of ${ref}:${tag}"
+
+	for file in "$@"; do
+		digest=$(jq -r --arg f "${file}" \
+			'.layers[] | select(.annotations["org.opencontainers.image.title"] == $f) | .digest' \
+			<<< "${manifest}")
+		[[ -n "${digest}" ]] || die "nvidia: ${file} not found in ${ref}:${tag}"
+		curl -fsSL -H "Authorization: Bearer ${token}" -o "${BUILD_DIR}/${file}" \
+			"https://${registry}/v2/${repo}/blobs/${digest}" \
+			|| die "nvidia: failed to download ${file} (${digest}) from ${ref}:${tag}"
+	done
+}
+
+# NVRC comes from a release unless versions.yaml points at the artefacts an
+# NVRC pull request published (url "oci://ghcr.io/nvidia/nvrc/nvrc-pr",
+# version "<head sha>"). That is for testing only:
+# ci/check_nvrc_is_released.sh keeps such a pin from being merged.
 setup_nvidia-nvrc() {
-	local url ver
+	local url ver id
 	local nvrc=NVRC-${machine_arch}-unknown-linux-musl
+	local files=("${nvrc}.tar.xz" "${nvrc}.tar.xz.sig" "${nvrc}.tar.xz.cert")
 	url=$(get_package_version_from_kata_yaml "externals.nvrc.url")
 	ver=$(get_package_version_from_kata_yaml "externals.nvrc.version")
 
-	local dl="${url}/${ver}"
-	curl -fsSL -o "${BUILD_DIR}/${nvrc}.tar.xz" "${dl}/${nvrc}.tar.xz"
-	curl -fsSL -o "${BUILD_DIR}/${nvrc}.tar.xz.sig" "${dl}/${nvrc}.tar.xz.sig"
-	curl -fsSL -o "${BUILD_DIR}/${nvrc}.tar.xz.cert" "${dl}/${nvrc}.tar.xz.cert"
+	# Each source has its own signing workflow, so a pull request artefact can
+	# never pass as a release.
+	if [[ "${url}" == oci://* ]]; then
+		echo "nvidia: using NVRC pull request artefacts ${url}:${ver}, NOT a release"
+		oci_artifact_fetch "${url#oci://}" "${ver}" "${files[@]}"
+		id="^https://github.com/NVIDIA/nvrc/.github/workflows/publish-pr-artefacts.yaml@refs/heads/main$"
+	else
+		local file
+		for file in "${files[@]}"; do
+			curl -fsSL -o "${BUILD_DIR}/${file}" "${url}/${ver}/${file}"
+		done
+		id="^https://github.com/NVIDIA/nvrc/.github/workflows/release.yaml@refs/heads/main$"
+	fi
 
-	local id="^https://github.com/NVIDIA/nvrc/.github/workflows/.+@refs/heads/main$"
 	local oidc="https://token.actions.githubusercontent.com"
 
-	# Only allow releases from the NVIDIA/nvrc main branch and build by github actions
+	# Only allow artefacts built by github actions from the NVIDIA/nvrc main branch
 	cosign verify-blob                                 \
 	  --rekor-url https://rekor.sigstore.dev           \
 	  --certificate "${BUILD_DIR}/${nvrc}.tar.xz.cert" \
@@ -179,7 +227,8 @@ install_nvidia_driver_packages() {
 	local rootfs_dir="${1:?rootfs dir required}"
 	local install_nvrc="${2:-yes}"
 	local cuda_repo_url cuda_repo_pkg gpu_base_os_version ctk_version
-	local tools_repo_url tools_repo_pkg
+	local tools_repo_url tools_repo_pkg dcgm_version dcgm_exporter_version
+	local driver_repo_url driver_repo_pkg
 
 	cp "${SCRIPT_DIR}/nvidia_chroot.sh" "${rootfs_dir}/nvidia_chroot.sh"
 	chmod +x "${rootfs_dir}/nvidia_chroot.sh"
@@ -199,7 +248,17 @@ install_nvidia_driver_packages() {
 	gpu_base_os_version=$(get_package_version_from_kata_yaml "assets.image.architecture.${machine_arch}.nvidia-gpu.version")
 	tools_repo_url=$(get_package_version_from_kata_yaml "externals.nvidia.tools.repo.${machine_arch}.url")
 	tools_repo_pkg=$(get_package_version_from_kata_yaml "externals.nvidia.tools.repo.${machine_arch}.pkg")
+
+	driver_repo_url=$(get_package_version_from_kata_yaml "externals.nvidia.driver.repo.${machine_arch}.url")
+	driver_repo_pkg=$(get_package_version_from_kata_yaml "externals.nvidia.driver.repo.${machine_arch}.pkg")
+	# Both or neither - fail before anything builds, not an hour later
+	# inside the chroot.
+	if [[ -n "${driver_repo_url}${driver_repo_pkg}" ]] && { [[ -z "${driver_repo_url}" ]] || [[ -z "${driver_repo_pkg}" ]]; }; then
+		die "driver repository misconfigured: url='${driver_repo_url}' pkg='${driver_repo_pkg}' - set both or neither"
+	fi
 	ctk_version=$(get_package_version_from_kata_yaml "externals.nvidia.ctk.version")
+	dcgm_version=$(get_package_version_from_kata_yaml "externals.nvidia.dcgm.version")
+	dcgm_exporter_version=$(get_package_version_from_kata_yaml "externals.nvidia.dcgm.exporter.version")
 
 	pushd "${rootfs_dir}" >> /dev/null
 
@@ -208,7 +267,9 @@ install_nvidia_driver_packages() {
 	mount -t proc /proc ./proc
 
 	chroot . /bin/bash -c "/nvidia_chroot.sh ${machine_arch} ${NVIDIA_GPU_STACK} \
-		 ${gpu_base_os_version} ${cuda_repo_url} ${cuda_repo_pkg} ${tools_repo_url} ${tools_repo_pkg} ${ctk_version}"
+		 ${gpu_base_os_version} ${cuda_repo_url} ${cuda_repo_pkg} ${tools_repo_url} ${tools_repo_pkg} ${ctk_version} \
+		 ${dcgm_version} ${dcgm_exporter_version} \
+		 ${driver_repo_url} ${driver_repo_pkg}"
 
 	umount -R ./dev
 	umount ./proc
@@ -217,11 +278,51 @@ install_nvidia_driver_packages() {
 	popd >> /dev/null
 }
 
+# Everything install_nvidia_driver_packages() resolves before it installs
+# anything. The archive name carries no version, so without this a BUILD_DIR
+# that survives between builds keeps serving a tree pinned to whatever
+# versions.yaml said when it was first created.
+nvidia_stage_one_fingerprint() {
+	{
+		echo "${NVIDIA_GPU_STACK:?}"
+		get_package_version_from_kata_yaml "externals.nvidia.ctk.version"
+		get_package_version_from_kata_yaml "externals.nvidia.dcgm.version"
+		get_package_version_from_kata_yaml "externals.nvidia.dcgm.exporter.version"
+		get_package_version_from_kata_yaml "externals.nvrc.version"
+		get_package_version_from_kata_yaml "assets.image.architecture.${machine_arch}.nvidia-gpu.version"
+		get_package_version_from_kata_yaml "externals.nvidia.cuda.repo.${machine_arch}.url"
+		get_package_version_from_kata_yaml "externals.nvidia.cuda.repo.${machine_arch}.pkg"
+		get_package_version_from_kata_yaml "externals.nvidia.tools.repo.${machine_arch}.url"
+		get_package_version_from_kata_yaml "externals.nvidia.tools.repo.${machine_arch}.pkg"
+		# Only when set - keeps the default fingerprint identical to
+		# before the driver repo existed. One record per field: a
+		# joint record would let different url/pkg splits collide.
+		local driver_repo_url driver_repo_pkg
+		driver_repo_url="$(get_package_version_from_kata_yaml "externals.nvidia.driver.repo.${machine_arch}.url")"
+		driver_repo_pkg="$(get_package_version_from_kata_yaml "externals.nvidia.driver.repo.${machine_arch}.pkg")"
+		if [[ -n "${driver_repo_url}${driver_repo_pkg}" ]]; then
+			echo "${driver_repo_url}"
+			echo "${driver_repo_pkg}"
+		fi
+	} | sha256sum | cut -d' ' -f1
+}
+
 setup_nvidia_gpu_rootfs_stage_one() {
 	setup_nvidia_upx
+
+	local fingerprint stamp=""
+	fingerprint="$(nvidia_stage_one_fingerprint)"
+	if [[ -r "${stage_one}.fingerprint" ]]; then
+		stamp="$(cat "${stage_one}.fingerprint")"
+	fi
+
 	if [[ -e "${stage_one}.tar.zst" ]]; then
-		info "nvidia: GPU rootfs stage one already exists"
-		return
+		if [[ "${stamp}" == "${fingerprint}" ]]; then
+			info "nvidia: GPU rootfs stage one already exists"
+			return
+		fi
+		info "nvidia: GPU rootfs stage one is stale, rebuilding it"
+		rm -f "${stage_one}.tar.zst" "${stage_one}.fingerprint"
 	fi
 
 	info "nvidia: Setup GPU rootfs stage one"
@@ -230,6 +331,8 @@ setup_nvidia_gpu_rootfs_stage_one() {
 	pushd "${ROOTFS_DIR}" >> /dev/null
 	tar cfa "${stage_one}.tar.zst" --remove-files -- *
 	popd >> /dev/null
+
+	echo "${fingerprint}" > "${stage_one}.fingerprint"
 }
 
 chisseled_iptables() {
@@ -431,6 +534,8 @@ chisseled_init() {
 	cp -a "${stage_one}"/sbin/ldconfig sbin/ldconfig
 
 	cp -a "${stage_one}"/etc/ssl/certs/ca-certificates.crt etc/ssl/certs/.
+	# A cached stage one may predate the check in the Ubuntu build_rootfs.
+	check_ca_bundle etc/ssl/certs/ca-certificates.crt
 
 	local conf_file="etc/modprobe.d/0000-nvidia.conf"
 	echo 'options nvidia NVreg_DeviceFileMode=0660' > "${conf_file}"
@@ -438,12 +543,16 @@ chisseled_init() {
 
 compress_rootfs() {
 	echo "nvidia: compressing rootfs"
-	local upx="${BUILD_DIR}/upx-4.2.4-${distro_arch}_linux/upx"
+	local upx
 
-	# The dedicated gpu-extension builder bakes UPX into PATH. The generic
-	# monolith/base builder keeps using setup_nvidia_upx() and its build path.
-	if command -v upx > /dev/null; then
-		upx="$(command -v upx)"
+	# The dedicated gpu-extension builder bakes the pinned UPX into PATH and
+	# carries no yq, so resolve it there without going through versions.yaml.
+	# Everywhere else only setup_nvidia_upx()'s build path will do: an upx that
+	# happens to be on PATH would silently pack with an unpinned version.
+	if [[ "${NVIDIA_GPU_EXTENSION_CONTAINER:-no}" == "yes" ]]; then
+		upx="$(command -v upx || true)"
+	else
+		upx="${BUILD_DIR}/upx-$(nvidia_upx_version)-${distro_arch}_linux/upx"
 	fi
 	[[ -x "${upx}" ]] || die "nvidia: UPX not found"
 
@@ -674,7 +783,7 @@ assemble_nvidia_gpu_extension() {
 			"${extension}/usr/share/nvidia/nvswitch/fabricmanager.cfg"
 	fi
 
-	# Materialize the SONAME symlinks (e.g. libcuda.so.1 -> libcuda.so.595.58.03)
+	# Materialize the SONAME symlinks (e.g. libcuda.so.1 -> libcuda.so.<driver-version>)
 	# inside the lib dir. The extension ships only the versioned files, so without
 	# this `nvidia-ctk cdi generate` has no symlink to replicate into the
 	# container (it reproduces existing links, it does not synthesize SONAMEs) and
