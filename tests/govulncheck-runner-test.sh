@@ -19,6 +19,9 @@ Vulnerability #2: GO-2026-5338
 
 Vulnerability #3: GO-2026-5064
     containerd checkpoint restore finding
+
+Vulnerability #5: GO-2026-6791
+    containerd checkpoint restore finding
 '
 
 if ! filter_and_check "kata-runtime" "${containerd_checkpoint_findings}" >/dev/null; then
@@ -37,7 +40,7 @@ if filtered=$(filter_and_check "kata-runtime" "${mixed_findings}"); then
 fi
 
 grep -q '^Vulnerability #4: GO-2026-6238$' <<< "${filtered}"
-if grep -q 'GO-2026-5622\|GO-2026-5338\|GO-2026-5064' <<< "${filtered}"; then
+if grep -q 'GO-2026-5622\|GO-2026-5338\|GO-2026-5064\|GO-2026-6791' <<< "${filtered}"; then
   echo "Expected only the guarded containerd findings to be removed" >&2
   exit 1
 fi
