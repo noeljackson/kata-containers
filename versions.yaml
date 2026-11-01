@@ -205,10 +205,10 @@ assets:
   kernel:
     description: "Linux kernel optimised for virtual machines"
     url: "https://cdn.kernel.org/pub/linux/kernel/v7.x/"
-    version: "v7.2.2"
+    version: "v7.2.15"
     nvidia:
       url: "https://cdn.kernel.org/pub/linux/kernel/v7.x/"
-      version: "v7.2.2"
+      version: "v7.2.15"
 
   kernel-dragonball-experimental:
     description: "Linux kernel with Dragonball VMM optimizations like upcall"

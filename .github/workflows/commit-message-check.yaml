@@ -89,9 +89,20 @@ jobs:
           exit 1
         fi
 
+        # The policy covers the downstream source commits this composition
+        # adds: those above the upstream base that the deployment base does
+        # not already contain. A recomposition onto a new upstream base adds
+        # every source commit; an incremental one adds only the new ones,
+        # and the rest are not among the pull request's commits.
+        new_source_count="$(git rev-list --count "${upstream_base}..${source_head}" "^${PR_BASE_SHA}")"
+        if (( new_source_count == 0 )); then
+          echo "Composition adds no source commits to the deployment base" >&2
+          exit 1
+        fi
+
         policy_shas="$(
           {
-            git rev-list --reverse "${upstream_base}..${source_head}"
+            git rev-list --reverse "${upstream_base}..${source_head}" "^${PR_BASE_SHA}"
             printf '%s\n' "${PR_HEAD_SHA}"
           } | jq -Rsc 'split("\n") | map(select(length > 0))'
         )"

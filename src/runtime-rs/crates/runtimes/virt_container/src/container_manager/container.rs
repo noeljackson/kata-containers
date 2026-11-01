@@ -22,6 +22,7 @@ use kata_types::{
     config::TomlConfig,
     container::update_ocispec_annotations,
     k8s::{self, container_type},
+    mount::Mount,
 };
 use oci_spec::runtime as oci;
 
@@ -151,6 +152,17 @@ impl Container {
             None => return Err(anyhow!("spec miss root field")),
         };
 
+        // The container engine appends the spec's SELinux mount label to the
+        // rootfs mounts as a context option. amend_spec has already dropped
+        // that label for the guest, so drop it from these mounts too: a guest
+        // without a loaded SELinux policy refuses any context option with
+        // EINVAL, which fails a block-device rootfs mount.
+        let rootfs_mounts = if disable_guest_selinux {
+            strip_selinux_context_options(&config.rootfs_mounts)
+        } else {
+            config.rootfs_mounts.clone()
+        };
+
         // handler rootfs
         let rootfs = self
             .resource_manager
@@ -158,7 +170,7 @@ impl Container {
                 &config.container_id,
                 root,
                 &config.bundle,
-                &config.rootfs_mounts,
+                &rootfs_mounts,
                 &updated_annotations,
             )
             .await
@@ -902,6 +914,25 @@ fn amend_spec(
     Ok(())
 }
 
+/// Mount options that set a filesystem's SELinux context.
+const SELINUX_CONTEXT_MOUNT_OPTIONS: [&str; 4] =
+    ["context=", "fscontext=", "defcontext=", "rootcontext="];
+
+fn strip_selinux_context_options(mounts: &[Mount]) -> Vec<Mount> {
+    mounts
+        .iter()
+        .cloned()
+        .map(|mut m| {
+            m.options.retain(|o| {
+                !SELINUX_CONTEXT_MOUNT_OPTIONS
+                    .iter()
+                    .any(|prefix| o.starts_with(prefix))
+            });
+            m
+        })
+        .collect()
+}
+
 fn get_disable_guest_selinux(toml_config: &TomlConfig) -> bool {
     match toml_config
         .hypervisor
@@ -1042,6 +1073,32 @@ mod tests {
         amend_spec(&mut spec, false, true).unwrap();
         assert!(spec.process().as_ref().unwrap().selinux_label().is_none());
         assert!(spec.linux().as_ref().unwrap().mount_label().is_none());
+    }
+
+    #[test]
+    fn test_strip_selinux_context_options() {
+        let mount = Mount {
+            source: "/var/lib/containerd/snapshots/1".to_owned(),
+            fs_type: "ext4".to_owned(),
+            options: vec![
+                "rw".to_owned(),
+                "context=\"system_u:object_r:container_file_t:s0:c1,c2\"".to_owned(),
+                "fscontext=system_u:object_r:container_file_t:s0".to_owned(),
+                "defcontext=system_u:object_r:container_file_t:s0".to_owned(),
+                "rootcontext=system_u:object_r:container_file_t:s0".to_owned(),
+                "loop".to_owned(),
+            ],
+            ..Default::default()
+        };
+
+        let stripped = strip_selinux_context_options(std::slice::from_ref(&mount));
+        assert_eq!(stripped.len(), 1);
+        assert_eq!(
+            stripped[0].options,
+            vec!["rw".to_owned(), "loop".to_owned()]
+        );
+        assert_eq!(stripped[0].source, mount.source);
+        assert_eq!(stripped[0].fs_type, mount.fs_type);
     }
 
     #[test]
