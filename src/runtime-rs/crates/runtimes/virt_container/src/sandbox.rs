@@ -964,12 +964,11 @@ impl VirtSandbox {
             }
         }
 
-        Ok(Some(BlockConfigModern {
-            path_on_host: boot_info.image.clone(),
-            is_readonly: true,
-            driver_option: boot_info.vm_rootfs_driver,
-            ..Default::default()
-        }))
+        Ok(Some(read_only_image_block_config(
+            boot_info.image.clone(),
+            boot_info.vm_rootfs_driver,
+            String::new(),
+        )))
     }
 
     async fn prepare_guest_extension_images_config(&self) -> Result<Vec<BlockConfigModern>> {
@@ -994,13 +993,11 @@ impl VirtSandbox {
             if extra.path.is_empty() {
                 continue;
             }
-            configs.push(BlockConfigModern {
-                path_on_host: extra.path.clone(),
-                is_readonly: true,
-                driver_option: block_driver.clone(),
-                serial_override: format!("extension-{}", extra.name),
-                ..Default::default()
-            });
+            configs.push(read_only_image_block_config(
+                extra.path.clone(),
+                block_driver.clone(),
+                format!("extension-{}", extra.name),
+            ));
         }
 
         Ok(configs)
@@ -2218,6 +2215,56 @@ impl Persist for VirtSandbox {
             vmm_exit_confirmed,
             vmm_process: Arc::new(RwLock::new(None)),
         })
+    }
+}
+
+/// Builds the block config of a read-only image shipped with the runtime: the
+/// guest rootfs image or a guest extension image.
+///
+/// Such an image is always opened without O_DIRECT, whatever
+/// `block_device_cache_direct` says. That setting is for writable volumes,
+/// whose writes must not land in the host page cache. A shipped image is
+/// read-only and shared by every VM, and it usually sits on a filesystem that
+/// refuses O_DIRECT, such as a host system extension's squashfs, where the open
+/// fails with EINVAL and the VM never starts.
+fn read_only_image_block_config(
+    path_on_host: String,
+    driver_option: String,
+    serial_override: String,
+) -> BlockConfigModern {
+    BlockConfigModern {
+        path_on_host,
+        is_readonly: true,
+        is_direct: Some(false),
+        driver_option,
+        serial_override,
+        ..Default::default()
+    }
+}
+
+#[cfg(test)]
+mod read_only_image_tests {
+    use super::*;
+
+    #[test]
+    fn shipped_images_never_inherit_direct_io() {
+        let rootfs = read_only_image_block_config(
+            "/usr/share/kata-containers/kata-containers.img".into(),
+            "virtio-blk-pci".into(),
+            String::new(),
+        );
+        assert!(rootfs.is_readonly);
+        assert_eq!(rootfs.is_direct, Some(false));
+        assert!(rootfs.serial_override.is_empty());
+
+        let extension = read_only_image_block_config(
+            "/usr/share/kata-containers/extension.img".into(),
+            "virtio-blk-pci".into(),
+            "extension-tools".into(),
+        );
+        assert!(extension.is_readonly);
+        assert_eq!(extension.is_direct, Some(false));
+        assert_eq!(extension.serial_override, "extension-tools");
     }
 }
 
